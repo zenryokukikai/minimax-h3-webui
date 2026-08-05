@@ -126,6 +126,145 @@ NVFP4 がネイティブで動くぶんファイルサイズが約半分（46GB 
 なお公開されている DGX Spark のベンチではもっと遅い数字（5秒480pで6分程度）も
 報告されていますが、それらは量子化形式やバックエンドが最適でない構成と思われます。
 
+## API
+
+Web UI と同じ `/v1` を、そのままプログラムから呼べます（UI 自身がこの API の
+クライアントです）。機械可読な定義は `GET /v1/openapi.json`。
+
+### 投入 → 完了検知 → ダウンロード
+
+**投入は即座に id を返します**（完了は待ちません）。
+
+```bash
+curl -sX POST http://your-host:18190/v1/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"雨の夜の路地。音: 雨音と遠くの雷","width":864,"height":480,"seconds":5}'
+```
+
+```json
+{
+  "id": "9e23c38f-6e37-4438-af24-89b88c8e90b2",
+  "status": "queued",
+  "queue_position": 1,
+  "progress": {"step": 0, "total": 20, "percent": 0.0},
+  "request": {"seed": 4821..., "width": 864, "height": 480, "seconds": 5.17, "length": 124},
+  "relative_cost": 1.0
+}
+```
+
+状態を見て、`status` が `done` になったら `video_url` が入ります。
+
+```bash
+curl -s http://your-host:18190/v1/jobs/$ID
+```
+
+```json
+{
+  "id": "9e23c38f-...", "status": "done",
+  "progress": {"step": 20, "total": 20, "percent": 100.0},
+  "elapsed_sec": 110.2,
+  "video_url": "/v1/jobs/9e23c38f-.../video"
+}
+```
+
+```bash
+curl -o out.mp4 "http://your-host:18190/v1/jobs/$ID/video"
+```
+
+`status` は `queued` → `running` → `decoding` → `done` と遷移します
+（異常時は `error` / `cancelled`）。`queue_position` は 0 が実行中、
+1 以上が「自分より前に残っている件数」です。
+
+短いクリップなら `"wait": true` を付けると完了までブロックして
+最終結果をそのまま返します（`"timeout"` 秒で打ち切り、既定1800秒）。
+
+### 複数リクエストのキューイング
+
+ComfyUI は一度に1件しか実行しないため、**続けて投入すれば自動的に直列のキューに並びます**。
+投入側は待つ必要がなく、id は数ミリ秒で返ります。
+
+```bash
+curl -s http://your-host:18190/v1/queue
+```
+
+```json
+{"running": [{"id": "...", "queue_position": 0, "status": "running", ...}],
+ "pending": [{"id": "...", "queue_position": 1, ...}],
+ "pending_count": 1}
+```
+
+取り消しは対象がどこにいるかで動作が変わります。**キュー待ちならその1件だけを
+キューから外し、実行中なら中断します**（待機中のジョブを取り消しても、
+実行中の別ジョブは巻き込まれません）。
+
+```bash
+curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
+```
+
+### エンドポイント
+
+| メソッド | パス | 用途 |
+|---|---|---|
+| `GET` | `/v1/options` | 解像度プリセット・サンプラー・コスト式・モデル配置状況 |
+| `POST` | `/v1/images` | 参照画像を登録して `ref` を得る（multipart の `file`、または JSON の `data` に base64） |
+| `POST` | `/v1/generate` | 生成を投入。既定は非同期で即 id を返す |
+| `GET` | `/v1/jobs` | 最近のジョブ一覧（`?limit=`） |
+| `GET` | `/v1/jobs/{id}` | 状態・進捗・完了時の `video_url` |
+| `GET` | `/v1/jobs/{id}/video` | mp4（音声つき）。`?download=1` で添付ダウンロード |
+| `POST` | `/v1/jobs/{id}/cancel` | キューから外す、または実行中なら中断 |
+| `GET` | `/v1/queue` | キューの現況 |
+| `GET` | `/healthz` | ヘルスチェック |
+
+### `POST /v1/generate` のパラメータ
+
+| キー | 既定 | 説明 |
+|---|---|---|
+| `prompt` | 必須 | 映像と音の内容。音の指示もここに書く |
+| `mode` | `t2v` | `t2v` / `i2v` / `ref2v` |
+| `width` `height` | 864 / 480 | 32の倍数に丸められる |
+| `seconds` | 5 | 24fps の 17k+5 フレーム格子に切り上げ |
+| `steps` | 20 | |
+| `seed` | ランダム | 省略・`null`・`-1` でランダム |
+| `sampler` `scheduler` | `res_multistep` / `simple` | |
+| `first_frame` `last_frame` | — | `mode=i2v`。`/v1/images` が返す `ref` |
+| `ref_images` | — | `mode=ref2v`。最大9枚。プロンプト中で `<Picture 1>` … と参照 |
+| `ref_image_size` | `match` | `max` は同一性重視だが数倍遅い |
+| `wait` `timeout` | `false` / 1800 | `true` で完了までブロック |
+
+エラーは HTTP ステータスと `{"error": {"code", "message"}}` で返ります。
+
+### 認証
+
+`H3_API_KEY` を設定すると `/v1/*` に `Authorization: Bearer <key>` が必要になります
+（`X-API-Key` ヘッダでも可）。未設定なら認証なしです。Web UI は 401 を受けると
+キーの入力を求め、`localStorage` に保存します。
+
+### Python クライアント
+
+`tools/h3_client.py` が標準ライブラリだけで動くクライアントです。
+
+```python
+from h3_client import H3Client
+
+c = H3Client("http://your-host:18190")       # 既定は $H3_URL
+job = c.generate("雨の夜の路地。音: 雨音", width=864, height=480)   # 即 id が返る
+final = c.wait(job["id"], on_progress=lambda s: print(s["status"], s["progress"]))
+c.download(job["id"], "out.mp4")
+```
+
+CLI としても使えます。
+
+```bash
+export H3_URL=http://your-host:18190
+python tools/h3_client.py options
+python tools/h3_client.py generate "雨の夜の路地。音: 雨音" -o out.mp4
+python tools/h3_client.py generate "..." --mode i2v --image first.png -o out.mp4
+python tools/h3_client.py jobs
+```
+
+`tools/test_queue.py` はキューイングの結合テストです（複数投入・順位・
+待機中だけの取消・完了検知・ダウンロードまでを通しで確認します）。
+
 ## 生成コストは画素数でほぼ決まる
 
 A100 80GB / INT8 ConvRot / 20ステップ / 124フレーム での 1ステップあたり実測値:
@@ -201,7 +340,9 @@ app/
 scripts/
   start.sh  stop.sh  deploy.sh  config.example.sh
 tools/
+  h3_client.py         API の Python クライアント兼 CLI（標準ライブラリのみ）
   sweep_resolution.py  解像度ごとのコストと画質を実測する
+  test_queue.py        キューイングの結合テスト
 ```
 
 公式ワークフローテンプレート (`video_minimax_h3_{t2v,i2v,r2v}.json`) のサブグラフを

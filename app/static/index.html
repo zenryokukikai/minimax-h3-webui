@@ -188,12 +188,35 @@
 </main>
 
 <script>
+// 画面は /v1 API をそのまま叩く。プログラムから使う場合も同じエンドポイント。
 const $ = (s) => document.querySelector(s);
 let MODE = "t2v";
 let CFG = null;
 let POLL = null;
+let CURRENT = null;
 const flFiles = [];   // 先頭・末尾フレーム
 const refFiles = [];  // 参照画像
+
+const apiKey = () => localStorage.getItem("h3_api_key") || "";
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  if (apiKey()) headers["Authorization"] = "Bearer " + apiKey();
+  const r = await fetch(path, Object.assign({}, opts, { headers }));
+  if (r.status === 401) {
+    const k = prompt("API キーを入力してください");
+    if (k) { localStorage.setItem("h3_api_key", k); return api(path, opts); }
+  }
+  return r;
+}
+
+async function apiJson(path, opts) {
+  const r = await api(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok && body.error) throw new Error(body.error.message || body.error.code);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return body;
+}
 
 function snapSeconds(sec) {
   let L = Math.max(5, Math.round(sec * 24));
@@ -219,9 +242,8 @@ document.querySelectorAll(".tabs button").forEach((b) => {
 async function upload(file) {
   const fd = new FormData();
   fd.append("file", file);
-  const r = await fetch("/api/upload", { method: "POST", body: fd });
-  if (!r.ok) throw new Error(await r.text());
-  return (await r.json()).name;
+  const body = await apiJson("/v1/images", { method: "POST", body: fd });
+  return body.ref;
 }
 
 function wireDrop(dropSel, thumbSel, store, max, labels) {
@@ -246,8 +268,7 @@ function wireDrop(dropSel, thumbSel, store, max, labels) {
       if (store.length >= max) break;
       drop.textContent = "アップロード中…";
       try {
-        const name = await upload(file);
-        store.push({ name, url: URL.createObjectURL(file) });
+        store.push({ name: await upload(file), url: URL.createObjectURL(file) });
       } catch (e) { alert("アップロード失敗: " + e.message); }
       render();
     }
@@ -268,29 +289,12 @@ function wireDrop(dropSel, thumbSel, store, max, labels) {
 wireDrop("#drop-fl", "#thumbs-fl", flFiles, 2, ["先頭", "末尾"]);
 wireDrop("#drop-ref", "#thumbs-ref", refFiles, 9, null);
 
-async function loadConfig() {
-  const r = await fetch("/api/config");
-  if (!r.ok) {
-    $("#health").innerHTML = `<b class="bad">ComfyUI 未接続</b>`;
-    return;
-  }
-  CFG = await r.json();
-  const keep = $("#res").value;
-  $("#res").innerHTML = CFG.resolutions
-    .map((p) => `<option value="${p.width}x${p.height}">${p.label}</option>`).join("")
-    + `<option value="custom">カスタム（自由入力）</option>`;
-  if (keep) $("#res").value = keep;
-  $("#sampler").innerHTML = CFG.samplers
-    .map((s) => `<option${s === "res_multistep" ? " selected" : ""}>${s}</option>`).join("");
-  $("#scheduler").innerHTML = CFG.schedulers
-    .map((s) => `<option${s === "simple" ? " selected" : ""}>${s}</option>`).join("");
-
-  const R = CFG.ready;
-  const missing = Object.entries(R).filter(([, v]) => !v).map(([k]) => k);
-  $("#health").innerHTML = missing.length
-    ? `<b class="bad">未配置: ${missing.join(", ")}</b>`
-    : `<b>モデル読込可</b>`;
-  $("#go").disabled = !(R.clip && R.video_vae && R.audio_vae && (R.fl2va || R.ref2va));
+// 生成コストは実測上ほぼ画素数だけで決まる（サーバ側と同じ係数）
+function relativeCost(w, h) {
+  const m = CFG && CFG.cost_model;
+  if (!m) return null;
+  const f = (px) => { const mp = px / 1e6; return m.c + m.linear * mp + m.quad * mp * mp; };
+  return f(w * h) / f(m.baseline_px);
 }
 
 const snap32 = (v) => Math.max(32, Math.round(v / 32) * 32);
@@ -301,14 +305,6 @@ function currentSize() {
             snap32(parseInt($("#ch").value, 10) || 384)];
   }
   return $("#res").value.split("x").map(Number);
-}
-
-// 生成コストは実測上ほぼ画素数だけで決まる（サーバ側と同じ係数）
-function relativeCost(w, h) {
-  const m = CFG && CFG.cost_model;
-  if (!m) return null;
-  const f = (px) => { const mp = px / 1e6; return m.c + m.linear * mp + m.quad * mp * mp; };
-  return f(w * h) / f(m.baseline_px);
 }
 
 function updateCustomHint() {
@@ -329,6 +325,33 @@ function updateCustomHint() {
 $("#res").addEventListener("change", updateCustomHint);
 $("#cw").addEventListener("input", updateCustomHint);
 $("#ch").addEventListener("input", updateCustomHint);
+
+async function loadConfig() {
+  let cfg;
+  try {
+    cfg = await apiJson("/v1/options");
+  } catch (e) {
+    $("#health").innerHTML = `<b class="bad">${e.message}</b>`;
+    return;
+  }
+  CFG = cfg;
+  const keep = $("#res").value;
+  $("#res").innerHTML = CFG.resolutions
+    .map((p) => `<option value="${p.width}x${p.height}">${p.label}</option>`).join("")
+    + `<option value="custom">カスタム（自由入力）</option>`;
+  if (keep) $("#res").value = keep;
+  $("#sampler").innerHTML = CFG.samplers
+    .map((s) => `<option${s === "res_multistep" ? " selected" : ""}>${s}</option>`).join("");
+  $("#scheduler").innerHTML = CFG.schedulers
+    .map((s) => `<option${s === "simple" ? " selected" : ""}>${s}</option>`).join("");
+
+  const R = CFG.ready;
+  const missing = Object.entries(R).filter(([, v]) => !v).map(([k]) => k);
+  $("#health").innerHTML = missing.length
+    ? `<b class="bad">未配置: ${missing.join(", ")}</b>`
+    : `<b>モデル読込可</b>`;
+  $("#go").disabled = !(R.text_encoder && R.video_vae && R.audio_vae && (R.t2v || R.ref2v));
+}
 
 $("#go").addEventListener("click", async () => {
   const [w, h] = currentSize();
@@ -358,56 +381,73 @@ $("#go").addEventListener("click", async () => {
   $("#cancel").style.display = "block";
   setStatus("キューに投入中…", false);
 
-  const r = await fetch("/api/generate", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    setStatus("投入失敗: " + (await r.text()), true);
-    $("#go").disabled = false; $("#cancel").style.display = "none";
-    return;
+  try {
+    const job = await apiJson("/v1/generate", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    CURRENT = job.id;
+    watch(job);
+  } catch (e) {
+    setStatus("投入失敗: " + e.message, true);
+    finish();
   }
-  const job = await r.json();
-  watch(job);
 });
 
 $("#cancel").addEventListener("click", async () => {
-  await fetch("/api/cancel", { method: "POST" });
+  if (CURRENT) await api(`/v1/jobs/${CURRENT}/cancel`, { method: "POST" });
   setStatus("中断しました", true);
-  clearInterval(POLL);
-  $("#go").disabled = false; $("#cancel").style.display = "none";
+  finish();
 });
+
+function finish() {
+  clearInterval(POLL);
+  $("#go").disabled = false;
+  $("#cancel").style.display = "none";
+}
 
 function setStatus(text, isErr) {
   $("#status").textContent = text;
   $("#status").className = isErr ? "err" : "";
 }
 
+const LABEL = { queued: "キュー待ち", running: "生成中", decoding: "VAE デコード中" };
+
 function watch(job) {
-  const started = Date.now();
   clearInterval(POLL);
   POLL = setInterval(async () => {
-    const r = await fetch(`/api/status/${job.prompt_id}`);
-    const s = await r.json();
-    const el = Math.round((Date.now() - started) / 1000);
-    const pct = s.total ? Math.round((s.step / s.total) * 100) : 0;
-    $("#bar").firstElementChild.style.width = pct + "%";
+    let s;
+    try { s = await apiJson(`/v1/jobs/${job.id}`); }
+    catch (e) { setStatus(e.message, true); finish(); return; }
 
-    if (s.state === "queued") setStatus(`キュー待ち… (${el}秒)`, false);
-    else if (s.state === "running")
-      setStatus(`生成中 ${s.step}/${s.total} ステップ (${pct}%) — 経過 ${el}秒`, false);
-    else if (s.state === "finishing") setStatus(`VAE デコード中… (${el}秒)`, false);
-    else if (s.state === "error") {
-      setStatus("エラー: " + (s.error || "不明"), true);
-      clearInterval(POLL); $("#go").disabled = false; $("#cancel").style.display = "none";
-    } else if (s.state === "done" && s.videos && s.videos.length) {
-      setStatus(`完了 — ${el}秒 / seed ${job.seed} / ${job.seconds}秒 ${job.length}フレーム`, false);
-      $("#bar").firstElementChild.style.width = "100%";
-      $("#result").innerHTML = s.videos.map((u) => `
-        <video src="${u}" controls autoplay loop></video>
-        <div class="meta">seed ${job.seed} · ${job.seconds}秒 (${job.length}f) ·
-          <a href="${u}" download>ダウンロード</a></div>`).join("");
-      clearInterval(POLL); $("#go").disabled = false; $("#cancel").style.display = "none";
+    const el = s.elapsed_sec != null ? `${Math.round(s.elapsed_sec)}秒` : "";
+    const p = s.progress || {};
+    $("#bar").firstElementChild.style.width = (p.percent || 0) + "%";
+
+    if (s.status === "error") {
+      setStatus("エラー: " + (s.error || "不明"), true); finish(); return;
     }
+    if (s.status === "cancelled") { setStatus("中断しました", true); finish(); return; }
+    if (s.status === "done" && s.video_url) {
+      const r = s.request || {};
+      setStatus(`完了 — ${el} / seed ${r.seed} / ${r.seconds}秒 ${r.length}フレーム`, false);
+      $("#bar").firstElementChild.style.width = "100%";
+      $("#result").innerHTML = `
+        <video src="${s.video_url}" controls autoplay loop></video>
+        <div class="meta">seed ${r.seed} · ${r.width}x${r.height} · ${r.seconds}秒 (${r.length}f) ·
+          <a href="${s.video_url}" download>ダウンロード</a></div>`;
+      finish(); return;
+    }
+    if (s.status === "queued") {
+      const n = s.queue_position;
+      const wait = s.queued_sec != null ? `${Math.round(s.queued_sec)}秒` : "";
+      setStatus(n > 0 ? `キュー待ち — 前に ${n} 件 (${wait})`
+                      : `キュー投入済み… ${wait}`, false);
+      return;
+    }
+    const name = LABEL[s.status] || s.status;
+    setStatus(p.total ? `${name} ${p.step}/${p.total} (${p.percent}%) — 経過 ${el}`
+                      : `${name}… ${el}`, false);
   }, 1000);
 }
 

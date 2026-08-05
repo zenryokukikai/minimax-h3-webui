@@ -20,6 +20,10 @@
 # ComfyUI は常に 127.0.0.1 で待ち受けます（外部に晒さない）
 : "${H3_COMFY_PORT:=18188}"
 
+# 設定すると /v1/* に Authorization: Bearer <key> が必要になります。
+# 空なら認証なし。ローカルホスト以外に公開するなら設定を推奨。
+: "${H3_API_KEY:=}"
+
 # GPU 世代に応じた追加フラグ
 #   Ampere (A100 / RTX 30xx) でドライバが CUDA 13 に届かない場合、
 #   comfy-kitchen の CUDA バックエンドが無効になるため Triton 版を使う:
@@ -27,4 +31,4 @@
 #   Blackwell (GB10 / RTX 50xx) で cu130 が載っているなら指定不要。
 : "${H3_COMFY_EXTRA_ARGS:=}"
 
-export H3_SSH_HOST H3_ROOT H3_UI_HOST H3_UI_PORT H3_COMFY_PORT H3_COMFY_EXTRA_ARGS
+export H3_SSH_HOST H3_ROOT H3_UI_HOST H3_UI_PORT H3_COMFY_PORT H3_COMFY_EXTRA_ARGS H3_API_KEY

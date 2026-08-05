@@ -38,6 +38,8 @@ start_ui() {
     return
   fi
   echo "Web UI を起動します…"
+  # API キーは環境変数 H3_API_KEY 経由で渡す（ps に出さないため）
+  H3_API_KEY="${H3_API_KEY:-}" \
   setsid nohup "$PY" "$ROOT/app/server.py" \
     --host "$UI_HOST" --port "$UI_PORT" \
     --comfy "http://127.0.0.1:$COMFY_PORT" \
