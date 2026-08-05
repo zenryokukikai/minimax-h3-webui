@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniMax-H3 — 動画+音声生成</title>
+<style>
+  :root {
+    --bg: #11131a; --panel: #191c26; --panel2: #212533; --line: #2e3446;
+    --fg: #e6e9f2; --muted: #8d95ab; --accent: #6c8cff; --accent2: #4fd1a5;
+    --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+    font-size: 14px; line-height: 1.6;
+  }
+  header {
+    padding: 14px 22px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  #health { margin-left: auto; font-size: 12px; color: var(--muted); }
+  #health b { color: var(--accent2); font-weight: 600; }
+  #health b.bad { color: var(--err); }
+
+  main { display: grid; grid-template-columns: minmax(360px, 460px) 1fr; gap: 0; min-height: calc(100vh - 56px); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  #panel { padding: 20px 22px; border-right: 1px solid var(--line); overflow-y: auto; }
+  #stage { padding: 20px 22px; display: flex; flex-direction: column; gap: 14px; }
+
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
+  .tabs button {
+    flex: 1; padding: 8px 4px; background: var(--panel); color: var(--muted);
+    border: 1px solid var(--line); border-radius: 8px; cursor: pointer; font-size: 13px;
+  }
+  .tabs button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 5px; }
+  textarea, input, select {
+    width: 100%; background: var(--panel); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px;
+    font-family: inherit; font-size: 13px;
+  }
+  textarea { min-height: 190px; resize: vertical; line-height: 1.7; }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+  details { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 10px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+
+  #go {
+    margin-top: 20px; width: 100%; padding: 12px; font-size: 15px; font-weight: 600;
+    background: var(--accent); color: #fff; border: 0; border-radius: 9px; cursor: pointer;
+  }
+  #go:disabled { background: var(--panel2); color: var(--muted); cursor: not-allowed; }
+  #cancel {
+    margin-top: 8px; width: 100%; padding: 8px; background: transparent; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 8px; cursor: pointer; font-size: 13px;
+  }
+
+  .drop {
+    border: 1px dashed var(--line); border-radius: 8px; padding: 12px; text-align: center;
+    color: var(--muted); font-size: 12px; cursor: pointer; background: var(--panel);
+  }
+  .drop:hover { border-color: var(--accent); }
+  .thumbs { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .thumbs figure { margin: 0; position: relative; }
+  .thumbs img { height: 62px; border-radius: 6px; display: block; border: 1px solid var(--line); }
+  .thumbs figcaption {
+    position: absolute; left: 4px; bottom: 4px; background: rgba(0,0,0,.7);
+    font-size: 10px; padding: 0 4px; border-radius: 3px;
+  }
+  .thumbs button {
+    position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%;
+    border: 0; background: var(--err); color: #fff; cursor: pointer; font-size: 11px; line-height: 1;
+  }
+
+  #progress { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  #bar { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 9px; }
+  #bar div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .3s; }
+  #status { font-size: 13px; }
+  #status.err { color: var(--err); }
+
+  video { width: 100%; border-radius: 10px; background: #000; }
+  .meta { font-size: 12px; color: var(--muted); }
+  .empty { color: var(--muted); border: 1px dashed var(--line); border-radius: 10px; padding: 40px; text-align: center; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>MiniMax-H3</h1>
+  <span class="sub">動画 + ネイティブステレオ音声 を単一 forward で同時生成</span>
+  <span id="health">起動確認中…</span>
+</header>
+
+<main>
+<section id="panel">
+  <div class="tabs">
+    <button data-mode="t2v" class="on">テキスト→動画</button>
+    <button data-mode="i2v">画像→動画</button>
+    <button data-mode="ref2v">参照画像</button>
+  </div>
+
+  <label for="prompt">プロンプト</label>
+  <textarea id="prompt" placeholder="映像の内容・カメラワーク・音（セリフ / 効果音 / BGM）をまとめて記述します。
+
+例:
+夕暮れの東京の路地。ネオンが濡れた路面に映り込む。手持ちカメラでゆっくり前進。
+[0s-2s] 傘をさした人物の背中を追う。
+[2s-5s] 振り返って正面のクローズアップ、雨音が強まる。
+音: 雨音、遠くの electronic な BGM、2秒地点で雷鳴。"></textarea>
+  <div class="hint">音声もこのプロンプトから同時生成されます。「音:」の行で指示すると効きます。</div>
+
+  <div id="imgpane" style="display:none">
+    <label>先頭フレーム（必須）／末尾フレーム（任意）</label>
+    <div class="drop" id="drop-fl">クリック or ドラッグで画像を追加（最大2枚：先頭・末尾の順）</div>
+    <div class="thumbs" id="thumbs-fl"></div>
+  </div>
+
+  <div id="refpane" style="display:none">
+    <label>参照画像（最大9枚）</label>
+    <div class="drop" id="drop-ref">クリック or ドラッグで追加</div>
+    <div class="thumbs" id="thumbs-ref"></div>
+    <div class="hint">プロンプト中で <code>&lt;Picture 1&gt;</code>, <code>&lt;Picture 2&gt;</code> … と参照します。</div>
+    <label for="refsize">参照画像の解像度</label>
+    <select id="refsize">
+      <option value="match">match（生成解像度に合わせる・高速）</option>
+      <option value="max">max（短辺2048・同一性重視だが数倍遅い）</option>
+    </select>
+  </div>
+
+  <label for="res">解像度</label>
+  <select id="res"></select>
+  <div id="custom" style="display:none">
+    <div class="row" style="margin-top:8px">
+      <div>
+        <label for="cw">幅</label>
+        <input type="number" id="cw" value="640" min="192" max="1920" step="32">
+      </div>
+      <div>
+        <label for="ch">高さ</label>
+        <input type="number" id="ch" value="384" min="192" max="1920" step="32">
+      </div>
+    </div>
+    <div class="hint" id="customhint">32の倍数に丸められます。</div>
+  </div>
+
+  <div class="row">
+    <div>
+      <label for="sec">長さ <span id="seclabel">5.17秒</span></label>
+      <input type="range" id="sec" min="5" max="15" step="0.5" value="5">
+    </div>
+    <div>
+      <label for="steps">ステップ数</label>
+      <input type="number" id="steps" value="20" min="4" max="80">
+    </div>
+  </div>
+  <div class="hint">長さは 24fps の 17k+5 フレーム格子に切り上げられます（学習範囲は約5〜15秒）。</div>
+
+  <label for="seed">シード（空欄でランダム）</label>
+  <input type="text" id="seed" placeholder="ランダム">
+
+  <details>
+    <summary>詳細設定</summary>
+    <label for="sampler">サンプラー</label>
+    <select id="sampler"></select>
+    <label for="scheduler">スケジューラ</label>
+    <select id="scheduler"></select>
+  </details>
+
+  <button id="go">生成する</button>
+  <button id="cancel" style="display:none">中断</button>
+</section>
+
+<section id="stage">
+  <div id="progress" style="display:none">
+    <div id="status">待機中</div>
+    <div id="bar"><div></div></div>
+  </div>
+  <div id="result"><div class="empty">生成した動画がここに表示されます</div></div>
+</section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let MODE = "t2v";
+let CFG = null;
+let POLL = null;
+const flFiles = [];   // 先頭・末尾フレーム
+const refFiles = [];  // 参照画像
+
+function snapSeconds(sec) {
+  let L = Math.max(5, Math.round(sec * 24));
+  L = L + ((5 - (L % 17)) % 17);
+  return { length: L, seconds: (L / 24).toFixed(2) };
+}
+
+$("#sec").addEventListener("input", (e) => {
+  const s = snapSeconds(parseFloat(e.target.value));
+  $("#seclabel").textContent = `${s.seconds}秒 (${s.length}f)`;
+});
+
+document.querySelectorAll(".tabs button").forEach((b) => {
+  b.addEventListener("click", () => {
+    document.querySelectorAll(".tabs button").forEach((x) => x.classList.remove("on"));
+    b.classList.add("on");
+    MODE = b.dataset.mode;
+    $("#imgpane").style.display = MODE === "i2v" ? "block" : "none";
+    $("#refpane").style.display = MODE === "ref2v" ? "block" : "none";
+  });
+});
+
+async function upload(file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const r = await fetch("/api/upload", { method: "POST", body: fd });
+  if (!r.ok) throw new Error(await r.text());
+  return (await r.json()).name;
+}
+
+function wireDrop(dropSel, thumbSel, store, max, labels) {
+  const drop = $(dropSel);
+  const input = document.createElement("input");
+  input.type = "file"; input.accept = "image/*"; input.multiple = true; input.style.display = "none";
+  document.body.appendChild(input);
+
+  const render = () => {
+    $(thumbSel).innerHTML = store.map((f, i) => `
+      <figure>
+        <img src="${f.url}">
+        <figcaption>${labels ? (labels[i] || i + 1) : "Picture " + (i + 1)}</figcaption>
+        <button data-i="${i}">×</button>
+      </figure>`).join("");
+    $(thumbSel).querySelectorAll("button").forEach((b) =>
+      b.addEventListener("click", () => { store.splice(+b.dataset.i, 1); render(); }));
+  };
+
+  const add = async (files) => {
+    for (const file of files) {
+      if (store.length >= max) break;
+      drop.textContent = "アップロード中…";
+      try {
+        const name = await upload(file);
+        store.push({ name, url: URL.createObjectURL(file) });
+      } catch (e) { alert("アップロード失敗: " + e.message); }
+      render();
+    }
+    drop.textContent = drop.dataset.label;
+  };
+
+  drop.dataset.label = drop.textContent;
+  drop.addEventListener("click", () => input.click());
+  input.addEventListener("change", () => add([...input.files]));
+  drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.style.borderColor = "var(--accent)"; });
+  drop.addEventListener("dragleave", () => { drop.style.borderColor = ""; });
+  drop.addEventListener("drop", (e) => {
+    e.preventDefault(); drop.style.borderColor = "";
+    add([...e.dataTransfer.files].filter((f) => f.type.startsWith("image/")));
+  });
+}
+
+wireDrop("#drop-fl", "#thumbs-fl", flFiles, 2, ["先頭", "末尾"]);
+wireDrop("#drop-ref", "#thumbs-ref", refFiles, 9, null);
+
+async function loadConfig() {
+  const r = await fetch("/api/config");
+  if (!r.ok) {
+    $("#health").innerHTML = `<b class="bad">ComfyUI 未接続</b>`;
+    return;
+  }
+  CFG = await r.json();
+  const keep = $("#res").value;
+  $("#res").innerHTML = CFG.resolutions
+    .map((p) => `<option value="${p.width}x${p.height}">${p.label}</option>`).join("")
+    + `<option value="custom">カスタム（自由入力）</option>`;
+  if (keep) $("#res").value = keep;
+  $("#sampler").innerHTML = CFG.samplers
+    .map((s) => `<option${s === "res_multistep" ? " selected" : ""}>${s}</option>`).join("");
+  $("#scheduler").innerHTML = CFG.schedulers
+    .map((s) => `<option${s === "simple" ? " selected" : ""}>${s}</option>`).join("");
+
+  const R = CFG.ready;
+  const missing = Object.entries(R).filter(([, v]) => !v).map(([k]) => k);
+  $("#health").innerHTML = missing.length
+    ? `<b class="bad">未配置: ${missing.join(", ")}</b>`
+    : `<b>モデル読込可</b>`;
+  $("#go").disabled = !(R.clip && R.video_vae && R.audio_vae && (R.fl2va || R.ref2va));
+}
+
+const snap32 = (v) => Math.max(32, Math.round(v / 32) * 32);
+
+function currentSize() {
+  if ($("#res").value === "custom") {
+    return [snap32(parseInt($("#cw").value, 10) || 640),
+            snap32(parseInt($("#ch").value, 10) || 384)];
+  }
+  return $("#res").value.split("x").map(Number);
+}
+
+// 生成コストは実測上ほぼ画素数だけで決まる（サーバ側と同じ係数）
+function relativeCost(w, h) {
+  const m = CFG && CFG.cost_model;
+  if (!m) return null;
+  const f = (px) => { const mp = px / 1e6; return m.c + m.linear * mp + m.quad * mp * mp; };
+  return f(w * h) / f(m.baseline_px);
+}
+
+function updateCustomHint() {
+  const isCustom = $("#res").value === "custom";
+  $("#custom").style.display = isCustom ? "block" : "none";
+  if (!isCustom) return;
+  const [w, h] = currentSize();
+  const short = Math.min(w, h);
+  const cost = relativeCost(w, h);
+  const costTxt = cost ? `　コスト ${cost.toFixed(2)}×` : "";
+  const warn = short < 320
+    ? "　⚠ 短辺320px未満はゴーストや形状の崩れが出ます"
+    : (short < 384 ? "　⚠ 短辺384px未満は品質が落ちます" : "");
+  $("#customhint").textContent =
+    `生成サイズ ${w}x${h}（短辺 ${short}px、32の倍数に丸め）${costTxt}${warn}`;
+}
+
+$("#res").addEventListener("change", updateCustomHint);
+$("#cw").addEventListener("input", updateCustomHint);
+$("#ch").addEventListener("input", updateCustomHint);
+
+$("#go").addEventListener("click", async () => {
+  const [w, h] = currentSize();
+  const body = {
+    mode: MODE,
+    prompt: $("#prompt").value,
+    width: w, height: h,
+    seconds: parseFloat($("#sec").value),
+    steps: parseInt($("#steps").value, 10),
+    sampler: $("#sampler").value,
+    scheduler: $("#scheduler").value,
+    seed: $("#seed").value.trim() || null,
+  };
+  if (MODE === "i2v") {
+    if (!flFiles.length) return alert("先頭フレームの画像を追加してください");
+    body.first_frame = flFiles[0].name;
+    if (flFiles[1]) body.last_frame = flFiles[1].name;
+  }
+  if (MODE === "ref2v") {
+    if (!refFiles.length) return alert("参照画像を1枚以上追加してください");
+    body.ref_images = refFiles.map((f) => f.name);
+    body.ref_image_size = $("#refsize").value;
+  }
+
+  $("#go").disabled = true;
+  $("#progress").style.display = "block";
+  $("#cancel").style.display = "block";
+  setStatus("キューに投入中…", false);
+
+  const r = await fetch("/api/generate", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    setStatus("投入失敗: " + (await r.text()), true);
+    $("#go").disabled = false; $("#cancel").style.display = "none";
+    return;
+  }
+  const job = await r.json();
+  watch(job);
+});
+
+$("#cancel").addEventListener("click", async () => {
+  await fetch("/api/cancel", { method: "POST" });
+  setStatus("中断しました", true);
+  clearInterval(POLL);
+  $("#go").disabled = false; $("#cancel").style.display = "none";
+});
+
+function setStatus(text, isErr) {
+  $("#status").textContent = text;
+  $("#status").className = isErr ? "err" : "";
+}
+
+function watch(job) {
+  const started = Date.now();
+  clearInterval(POLL);
+  POLL = setInterval(async () => {
+    const r = await fetch(`/api/status/${job.prompt_id}`);
+    const s = await r.json();
+    const el = Math.round((Date.now() - started) / 1000);
+    const pct = s.total ? Math.round((s.step / s.total) * 100) : 0;
+    $("#bar").firstElementChild.style.width = pct + "%";
+
+    if (s.state === "queued") setStatus(`キュー待ち… (${el}秒)`, false);
+    else if (s.state === "running")
+      setStatus(`生成中 ${s.step}/${s.total} ステップ (${pct}%) — 経過 ${el}秒`, false);
+    else if (s.state === "finishing") setStatus(`VAE デコード中… (${el}秒)`, false);
+    else if (s.state === "error") {
+      setStatus("エラー: " + (s.error || "不明"), true);
+      clearInterval(POLL); $("#go").disabled = false; $("#cancel").style.display = "none";
+    } else if (s.state === "done" && s.videos && s.videos.length) {
+      setStatus(`完了 — ${el}秒 / seed ${job.seed} / ${job.seconds}秒 ${job.length}フレーム`, false);
+      $("#bar").firstElementChild.style.width = "100%";
+      $("#result").innerHTML = s.videos.map((u) => `
+        <video src="${u}" controls autoplay loop></video>
+        <div class="meta">seed ${job.seed} · ${job.seconds}秒 (${job.length}f) ·
+          <a href="${u}" download>ダウンロード</a></div>`).join("");
+      clearInterval(POLL); $("#go").disabled = false; $("#cancel").style.display = "none";
+    }
+  }, 1000);
+}
+
+loadConfig();
+setInterval(loadConfig, 30000);
+$("#sec").dispatchEvent(new Event("input"));
+</script>
+</body>
+</html>

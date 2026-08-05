@@ -1,0 +1,303 @@
+"""MiniMax-H3 の ComfyUI API 形式ワークフローを組み立てる。
+
+ComfyUI 0.30.0 の公式テンプレート (video_minimax_h3_{t2v,i2v,r2v}.json) の
+サブグラフを API 形式に展開したもの。ノード入力名は /api/object_info と
+comfy_extras/nodes_minimax_h3.py で確認済み。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+FPS = 24
+CANVAS_MULTIPLE = 32
+
+# 既定は Ampere (A100 等) 向けの INT8 ConvRot。
+# NVFP4 は Blackwell 専用命令、FP8 は Ada 以降なので、Ampere で
+# ネイティブに動く量子化形式は INT8 ConvRot だけになる。
+#
+# Blackwell (RTX 50xx / GB10 / B200) では NVFP4 がネイティブなので
+# models.json で差し替える。速度差は数%だがファイルサイズが約半分になる。
+_BUILTIN_MODELS = {
+    "unet_fl2va": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    "unet_ref2va": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+    "clip": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+    "video_vae": "minimax_h3_video_vae_fp16.safetensors",
+    "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+}
+
+
+def _load_models() -> dict:
+    """`models.json` があればファイル名を上書きする（ホストごとの差分吸収）。"""
+    path = Path(os.environ.get("H3_MODELS_JSON", Path(__file__).parent / "models.json"))
+    if not path.is_file():
+        return dict(_BUILTIN_MODELS)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    # `_` 始まりのキーはコメント用として無視する
+    override = {k: v for k, v in raw.items() if not k.startswith("_")}
+    unknown = set(override) - set(_BUILTIN_MODELS)
+    if unknown:
+        raise ValueError(
+            f"{path} に未知のキー: {sorted(unknown)} / "
+            f"有効なキー: {sorted(_BUILTIN_MODELS)}")
+    return {**_BUILTIN_MODELS, **override}
+
+
+DEFAULT_MODELS = _load_models()
+
+# 短辺 768px がネイティブ。幅・高さとも 32 の倍数であること。
+#
+# `cost` は 864x480 を 1.00 とした**相対的な**生成コストの目安。
+# 絶対的な所要時間は GPU によって桁で変わるのでここには持たせない
+# （同じ設定でも A100 80GB と DGX Spark で3倍以上違う）。
+# 同一画素数のプリセットには同じ値を与え、間は画素数から補間している。
+#
+# `quality` は同一プロンプト・同一シードで中間フレームを目視比較した結果:
+#   ok    … 構図・被写体とも破綻なし
+#   ghost … 半透明のゴースト・二重像が乗る
+#   rough … 被写体の形状が崩れる。構図の当たりを取る下書き用途のみ
+RESOLUTION_PRESETS = [
+    {"width": 1344, "height": 768, "quality": "ok", "note": "ネイティブ・最高品質"},
+    {"width": 1152, "height": 640, "quality": "ok", "note": ""},
+    {"width": 864, "height": 480, "quality": "ok", "note": "バランス型（コスト基準）"},
+    {"width": 768, "height": 448, "quality": "ok", "note": ""},
+    {"width": 672, "height": 384, "quality": "ok", "note": "短辺384px・公式の下限"},
+    {"width": 576, "height": 320, "quality": "ok", "note": "実用下限"},
+    {"width": 448, "height": 256, "quality": "ghost", "note": "試写用"},
+    {"width": 384, "height": 256, "quality": "ghost", "note": "試写用"},
+    {"width": 352, "height": 192, "quality": "rough", "note": "下書き用"},
+    {"width": 768, "height": 1344, "quality": "ok", "note": "縦"},
+    {"width": 640, "height": 1152, "quality": "ok", "note": "縦"},
+    {"width": 320, "height": 576, "quality": "ok", "note": "縦・実用下限"},
+    {"width": 992, "height": 992, "quality": "ok", "note": "正方形"},
+    {"width": 448, "height": 448, "quality": "ok", "note": "正方形・軽量"},
+    {"width": 1152, "height": 864, "quality": "ok", "note": ""},
+    {"width": 576, "height": 448, "quality": "ok", "note": "軽量"},
+    {"width": 864, "height": 1152, "quality": "ok", "note": "縦"},
+    {"width": 1344, "height": 576, "quality": "ok", "note": "シネスコ"},
+]
+
+_QUALITY_MARK = {"ok": "", "ghost": "⚠ゴーストあり", "rough": "⚠形状が崩れる"}
+
+# 生成コストは実測上ほぼ画素数だけで決まる。
+#   固定オーバーヘッド + MLP の線形項 + アテンションの二次項
+# A100 80GB / 20ステップ / 124フレーム で測った 1ステップあたり秒数
+#   0.068MP:0.91  0.115:1.40  0.184:2.10  0.258:3.00
+#   0.344:4.00    0.737:10.0  1.032:16.9
+# に上式を当てはめた係数（残差はおおむね5%以内）。
+# 係数の絶対値は GPU 依存なので、UI では 864x480 を 1.00 とした比だけを出す。
+_COST_C, _COST_LINEAR, _COST_QUAD = 0.332, 7.968, 7.836
+_COST_BASELINE_PX = 864 * 480
+
+
+def _raw_cost(pixels: int) -> float:
+    mp = pixels / 1_000_000
+    return _COST_C + _COST_LINEAR * mp + _COST_QUAD * mp * mp
+
+
+def relative_cost(width: int, height: int) -> float:
+    """864x480 を 1.00 とした相対生成コスト。"""
+    return _raw_cost(width * height) / _raw_cost(_COST_BASELINE_PX)
+
+
+_COMMON_ASPECTS = {"21:9": (21, 9), "16:9": (16, 9), "3:2": (3, 2), "4:3": (4, 3),
+                   "1:1": (1, 1), "3:4": (3, 4), "2:3": (2, 3), "9:16": (9, 16)}
+
+
+def _aspect(w: int, h: int) -> str:
+    """よくある比に近ければその名前で表す。
+
+    キャンバスは32の倍数に丸められるため 1344x768 のように厳密には
+    16:9 (1.778) ではなく 1.75 になる。4%以内なら「≈16:9」と表記する。
+    """
+    from math import gcd
+    ratio = w / h
+    for label, (x, y) in _COMMON_ASPECTS.items():
+        target = x / y
+        if abs(ratio - target) / target < 1e-9:
+            return label
+        if abs(ratio - target) / target < 0.04:
+            return "≈" + label
+    g = gcd(w, h)
+    return f"{w // g}:{h // g}"
+
+
+def resolution_options() -> list[dict]:
+    """UI 用にラベルを組み立てたプリセット一覧を返す。"""
+    out = []
+    for p in RESOLUTION_PRESETS:
+        cost = relative_cost(p["width"], p["height"])
+        parts = [f"{_aspect(p['width'], p['height']):>5}",
+                 f"{p['width']}x{p['height']}".ljust(9),
+                 f"コスト {cost:.2f}×"]
+        tail = " ".join(x for x in (_QUALITY_MARK[p["quality"]], p["note"]) if x)
+        if tail:
+            parts.append(tail)
+        out.append({**p, "cost": round(cost, 3), "label": "  ".join(parts)})
+    return out
+
+
+def seconds_to_length(seconds: float) -> int:
+    """秒数を H3 が受け付けるフレーム長 (24fps, 17k+5 グリッド) に切り上げる。
+
+    公式テンプレートの ComfyMathExpression と同じ式:
+        max(5, round(a*24)) + (5 - (max(5, round(a*24)) % 17)) % 17
+    """
+    length = max(5, round(seconds * FPS))
+    return length + (5 - (length % 17)) % 17
+
+
+def length_to_seconds(length: int) -> float:
+    return round(length / FPS, 2)
+
+
+def snap_dimension(value: int) -> int:
+    return max(CANVAS_MULTIPLE, round(value / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+
+
+def _loaders(unet_name: str, clip_name: str, video_vae: str, audio_vae: str) -> dict:
+    return {
+        "unet": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": unet_name, "weight_dtype": "default"},
+        },
+        "clip": {
+            "class_type": "CLIPLoader",
+            "inputs": {"clip_name": clip_name, "type": "minimax", "device": "default"},
+        },
+        "video_vae": {"class_type": "VAELoader", "inputs": {"vae_name": video_vae}},
+        "audio_vae": {"class_type": "VAELoader", "inputs": {"vae_name": audio_vae}},
+    }
+
+
+def _sampler_tail(prompt: dict, cond_node: str, steps: int, seed: int,
+                  sampler: str, scheduler: str, filename_prefix: str) -> dict:
+    """conditioning + latent を受け取ってサンプリング〜動画保存までを繋ぐ。"""
+    prompt["noise"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}}
+    prompt["guider"] = {
+        "class_type": "BasicGuider",
+        "inputs": {"model": ["unet", 0], "conditioning": [cond_node, 0]},
+    }
+    prompt["sampler"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": sampler}}
+    prompt["sigmas"] = {
+        "class_type": "BasicScheduler",
+        "inputs": {"model": ["unet", 0], "scheduler": scheduler, "steps": steps, "denoise": 1.0},
+    }
+    prompt["sample"] = {
+        "class_type": "SamplerCustomAdvanced",
+        "inputs": {
+            "noise": ["noise", 0],
+            "guider": ["guider", 0],
+            "sampler": ["sampler", 0],
+            "sigmas": ["sigmas", 0],
+            "latent_image": [cond_node, 1],
+        },
+    }
+    prompt["decode_video"] = {
+        "class_type": "VAEDecode",
+        "inputs": {"samples": ["sample", 0], "vae": ["video_vae", 0]},
+    }
+    prompt["decode_audio"] = {
+        "class_type": "VAEDecodeAudio",
+        "inputs": {"samples": ["sample", 0], "vae": ["audio_vae", 0]},
+    }
+    prompt["create_video"] = {
+        "class_type": "CreateVideo",
+        "inputs": {"images": ["decode_video", 0], "audio": ["decode_audio", 0], "fps": float(FPS)},
+    }
+    prompt["save"] = {
+        "class_type": "SaveVideo",
+        "inputs": {
+            "video": ["create_video", 0],
+            "filename_prefix": filename_prefix,
+            "format": "auto",
+            "codec": "auto",
+        },
+    }
+    return prompt
+
+
+def build_fl2va(
+    *,
+    prompt_text: str,
+    width: int,
+    height: int,
+    length: int,
+    seed: int,
+    steps: int = 20,
+    sampler: str = "res_multistep",
+    scheduler: str = "simple",
+    first_frame: str | None = None,
+    last_frame: str | None = None,
+    models: dict | None = None,
+    filename_prefix: str = "minimax_h3/h3",
+) -> dict:
+    """T2V / I2V / 先頭+末尾フレーム指定 (FL2VA チェックポイント)。"""
+    m = {**DEFAULT_MODELS, **(models or {})}
+    prompt = _loaders(m["unet_fl2va"], m["clip"], m["video_vae"], m["audio_vae"])
+
+    cond_inputs = {
+        "clip": ["clip", 0],
+        "vae": ["video_vae", 0],
+        "prompt": prompt_text,
+        "width": snap_dimension(width),
+        "height": snap_dimension(height),
+        "length": length,
+    }
+    if first_frame:
+        prompt["first_frame"] = {"class_type": "LoadImage", "inputs": {"image": first_frame}}
+        cond_inputs["first_frame"] = ["first_frame", 0]
+    if last_frame:
+        prompt["last_frame"] = {"class_type": "LoadImage", "inputs": {"image": last_frame}}
+        cond_inputs["last_frame"] = ["last_frame", 0]
+
+    prompt["cond"] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": cond_inputs}
+    return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix)
+
+
+def build_ref2va(
+    *,
+    prompt_text: str,
+    width: int,
+    height: int,
+    length: int,
+    seed: int,
+    steps: int = 20,
+    sampler: str = "res_multistep",
+    scheduler: str = "simple",
+    ref_images: list[str] | None = None,
+    ref_image_size: str = "match",
+    models: dict | None = None,
+    filename_prefix: str = "minimax_h3/h3_ref",
+) -> dict:
+    """参照画像つき生成 (Ref2VA チェックポイント)。
+
+    プロンプト中で <Picture 1>, <Picture 2> ... と参照する。
+    """
+    m = {**DEFAULT_MODELS, **(models or {})}
+    prompt = _loaders(m["unet_ref2va"], m["clip"], m["video_vae"], m["audio_vae"])
+
+    cond_inputs = {
+        "clip": ["clip", 0],
+        "vae": ["video_vae", 0],
+        "audio_vae": ["audio_vae", 0],
+        "prompt": prompt_text,
+        "width": snap_dimension(width),
+        "height": snap_dimension(height),
+        "length": length,
+        "ref_image_size": ref_image_size,
+    }
+
+    # Autogrow 入力は {"<prefix><n>": <link>} という辞書で渡す
+    autogrow = {}
+    for i, name in enumerate(ref_images or []):
+        node_id = f"ref_image_{i}"
+        prompt[node_id] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        autogrow[f"ref_image_{i}"] = [node_id, 0]
+    if autogrow:
+        cond_inputs["ref_images"] = autogrow
+
+    prompt["cond"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": cond_inputs}
+    return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix)

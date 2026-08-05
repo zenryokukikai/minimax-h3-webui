@@ -1,0 +1,6 @@
+{
+  "_comment": "Blackwell (RTX 50xx / GB10 / B200) 向け NVFP4 構成の例。app/models.json にコピーして使う。省略したキーは既定値 (Ampere 向け INT8 ConvRot) のまま。'_' 始まりのキーは無視される。",
+  "unet_fl2va": "MiniMax_H3_FL2VA_pruned_nvfp4.safetensors",
+  "unet_ref2va": "MiniMax_H3_Ref2VA_pruned_nvfp4.safetensors",
+  "clip": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+}

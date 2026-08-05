@@ -1,0 +1,10 @@
+# ホスト固有の設定（IP・ユーザー名・パスを含む）
+scripts/config.sh
+app/models.json
+
+# 生成物・キャッシュ
+__pycache__/
+*.pyc
+samples/
+logs/
+venv/
