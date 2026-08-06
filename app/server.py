@@ -44,6 +44,12 @@ LIMITS = {
     "seconds": {"min": 0.2, "max": 20, "default": 5},
     "dimension": {"min": 32, "max": 4096},
     "ref_images": {"min": 1, "max": 9},
+    # MiniMaxH3SigmaShift。映像と音声で別々の flow shift を持つ。
+    # 未指定ならノード自体を挟まないのでモデル本来の挙動になる。
+    "shift": {"min": 0.01, "max": 100.0,
+              "default_video": workflows.DEFAULT_SHIFT_VIDEO,
+              "default_audio": workflows.DEFAULT_SHIFT_AUDIO},
+    "audio_formats": sorted(workflows.AUDIO_SAVE_NODES),
 }
 
 JOBS: "dict[str, dict]" = {}
@@ -213,6 +219,10 @@ def job_view(job_id: str, job: dict) -> dict:
             "seed": job.get("seed"),
             "sampler": job.get("sampler"),
             "scheduler": job.get("scheduler"),
+            "audio": job.get("audio"),
+            "audio_format": job.get("audio_format"),
+            "shift_video": job.get("shift_video"),
+            "shift_audio": job.get("shift_audio"),
         },
         "relative_cost": job.get("relative_cost"),
         "created_at": job.get("created_at"),
@@ -227,6 +237,8 @@ def job_view(job_id: str, job: dict) -> dict:
         out["queued_sec"] = round(time.time() - job["queued_at"], 1)
     if job.get("video_url"):
         out["video_url"] = job["video_url"]
+    if job.get("audio_url"):
+        out["audio_url"] = job["audio_url"]
     if job.get("error"):
         out["error"] = job["error"]
     return out
@@ -281,20 +293,26 @@ async def refresh_from_history(comfy: Comfy, job_id: str, job: dict):
 
     for out in entry.get("outputs", {}).values():
         # SaveVideo は成果物を "images" キーに animated=true として返す
-        items = (out.get("videos") or []) + (out.get("gifs") or []) + (out.get("images") or [])
+        items = ((out.get("videos") or []) + (out.get("gifs") or [])
+                 + (out.get("images") or []) + (out.get("audio") or []))
         for item in items:
             name = str(item.get("filename", ""))
-            if name.lower().endswith((".mp4", ".webm", ".mkv", ".mov", ".gif")):
+            ref = {"filename": name,
+                   "subfolder": item.get("subfolder", ""),
+                   "type": item.get("type", "output")}
+            low = name.lower()
+            if low.endswith((".mp4", ".webm", ".mkv", ".mov", ".gif")):
                 job["video_url"] = f"/v1/jobs/{job_id}/video"
-                job["_comfy_file"] = {
-                    "filename": name,
-                    "subfolder": item.get("subfolder", ""),
-                    "type": item.get("type", "output"),
-                }
-                job["status"] = "done"
-                job.setdefault("finished_at", time.time())
-                job["_event"].set()
-                return
+                job["_comfy_file"] = ref
+            elif low.endswith((".flac", ".mp3", ".opus", ".wav")):
+                job["audio_url"] = f"/v1/jobs/{job_id}/audio"
+                job["_comfy_audio"] = ref
+
+    if job.get("video_url"):
+        job["status"] = "done"
+        job.setdefault("finished_at", time.time())
+        job["_event"].set()
+        return
 
 
 # ---------------------------------------------------------------- 入力検証
@@ -377,6 +395,32 @@ def parse_request(body: dict) -> dict:
             raise ApiError(400, "invalid_parameter", "ref_image_size は match / max です")
         req["ref_image_size"] = size
 
+    # 音声。H3 は映像と音声を単一 forward で同時生成するので「音声を作らない」
+    # 選択肢はない。audio=false は出力動画に音声トラックを入れないという意味。
+    req["audio"] = bool(body.get("audio", True))
+
+    fmt = body.get("audio_format")
+    if fmt not in (None, "", *workflows.AUDIO_SAVE_NODES):
+        raise ApiError(400, "invalid_parameter",
+                       f"audio_format は {sorted(workflows.AUDIO_SAVE_NODES)} "
+                       f"のいずれかです")
+    req["audio_format"] = fmt or None
+
+    lim = LIMITS["shift"]
+    for key in ("shift_video", "shift_audio"):
+        v = body.get(key)
+        if v is None:
+            req[key] = None
+            continue
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_parameter", f"{key} は数値で指定してください")
+        if not lim["min"] <= v <= lim["max"]:
+            raise ApiError(400, "invalid_parameter",
+                           f"{key} は {lim['min']}〜{lim['max']} の範囲です")
+        req[key] = v
+
     req["seconds"] = workflows.length_to_seconds(req["length"])
     req["relative_cost"] = round(workflows.relative_cost(width, height), 3)
     return req
@@ -387,6 +431,8 @@ def build_workflow(req: dict) -> dict:
         prompt_text=req["prompt"], width=req["width"], height=req["height"],
         length=req["length"], seed=req["seed"], steps=req["steps"],
         sampler=req["sampler"], scheduler=req["scheduler"],
+        audio=req["audio"], audio_format=req["audio_format"],
+        shift_video=req["shift_video"], shift_audio=req["shift_audio"],
     )
     if req["mode"] == "ref2v":
         return workflows.build_ref2va(
@@ -584,15 +630,19 @@ async def v1_queue(request):
     })
 
 
-async def v1_video(request):
+async def _stream_artifact(request, slot: str, fallback_type: str):
     comfy: Comfy = request.app["comfy"]
     job_id = request.match_info["job_id"]
     job = JOBS.get(job_id)
     if job is None:
         raise ApiError(404, "not_found", "そのジョブは存在しません")
     await refresh_from_history(comfy, job_id, job)
-    ref = job.get("_comfy_file")
+    ref = job.get(slot)
     if not ref:
+        if slot == "_comfy_audio" and job.get("status") == "done":
+            raise ApiError(404, "no_audio_file",
+                           "音声ファイルは出力されていません。"
+                           "生成時に audio_format を指定してください")
         raise ApiError(409, "not_ready",
                        f"まだ成果物がありません (status={job.get('status')})")
 
@@ -603,7 +653,7 @@ async def v1_video(request):
         if r.status >= 400:
             raise ApiError(502, "fetch_failed", "ComfyUI から成果物を取得できません")
         resp = web.StreamResponse(status=200, headers={
-            "Content-Type": r.headers.get("Content-Type", "video/mp4"),
+            "Content-Type": r.headers.get("Content-Type", fallback_type),
             "Content-Disposition": f'{disposition}; filename="{ref["filename"]}"',
         })
         await resp.prepare(request)
@@ -611,6 +661,15 @@ async def v1_video(request):
             await resp.write(chunk)
         await resp.write_eof()
         return resp
+
+
+async def v1_video(request):
+    return await _stream_artifact(request, "_comfy_file", "video/mp4")
+
+
+async def v1_audio(request):
+    """音声だけを取り出す（生成時に audio_format を指定した場合）。"""
+    return await _stream_artifact(request, "_comfy_audio", "audio/flac")
 
 
 async def v1_cancel(request):
@@ -678,7 +737,8 @@ OPENAPI = {
         "/v1/jobs": {"get": {"summary": "最近のジョブ一覧"}},
         "/v1/queue": {"get": {"summary": "キューの現況（実行中1件＋待機中を投入順で）"}},
         "/v1/jobs/{job_id}": {"get": {"summary": "ジョブの状態と進捗"}},
-        "/v1/jobs/{job_id}/video": {"get": {"summary": "生成された mp4（音声つき）"}},
+        "/v1/jobs/{job_id}/video": {"get": {"summary": "生成された mp4"}},
+        "/v1/jobs/{job_id}/audio": {"get": {"summary": "音声のみ（audio_format 指定時）"}},
         "/v1/jobs/{job_id}/cancel": {"post": {"summary": "実行中のジョブを中断"}},
         "/healthz": {"get": {"summary": "ヘルスチェック"}},
     },
@@ -713,6 +773,7 @@ def make_app(comfy_url: str, api_key: str = "") -> web.Application:
         web.get("/v1/queue", v1_queue),
         web.get("/v1/jobs/{job_id}", v1_job),
         web.get("/v1/jobs/{job_id}/video", v1_video),
+        web.get("/v1/jobs/{job_id}/audio", v1_audio),
         web.post("/v1/jobs/{job_id}/cancel", v1_cancel),
         web.static("/static", STATIC_DIR),
     ])

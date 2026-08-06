@@ -14,6 +14,11 @@ from pathlib import Path
 FPS = 24
 CANVAS_MULTIPLE = 32
 
+# MiniMaxH3SigmaShift ノードの既定値。映像と音声で別々の flow shift を持つ。
+# 指定がなければこのノード自体を挟まないので、モデル本来の挙動になる。
+DEFAULT_SHIFT_VIDEO = 12.0
+DEFAULT_SHIFT_AUDIO = 3.0
+
 # 既定は Ampere (A100 等) 向けの INT8 ConvRot。
 # NVFP4 は Blackwell 専用命令、FP8 は Ada 以降なので、Ampere で
 # ネイティブに動く量子化形式は INT8 ConvRot だけになる。
@@ -172,18 +177,48 @@ def _loaders(unet_name: str, clip_name: str, video_vae: str, audio_vae: str) -> 
     }
 
 
+# 音声を別ファイルでも出す場合の形式。SaveAudio は FLAC を書く。
+AUDIO_SAVE_NODES = {
+    "flac": ("SaveAudio", "flac", {}),
+    "mp3": ("SaveAudioMP3", "mp3", {"quality": "V0"}),
+    "opus": ("SaveAudioOpus", "opus", {"quality": "128k"}),
+}
+
+
 def _sampler_tail(prompt: dict, cond_node: str, steps: int, seed: int,
-                  sampler: str, scheduler: str, filename_prefix: str) -> dict:
-    """conditioning + latent を受け取ってサンプリング〜動画保存までを繋ぐ。"""
+                  sampler: str, scheduler: str, filename_prefix: str,
+                  audio: bool = True, audio_format: str | None = None,
+                  shift_video: float | None = None,
+                  shift_audio: float | None = None) -> dict:
+    """conditioning + latent を受け取ってサンプリング〜動画保存までを繋ぐ。
+
+    audio=False は「音声を生成しない」ではなく「出力動画に音声トラックを
+    入れない」。H3 は映像と音声を単一の forward で同時に作るので、音声の
+    計算自体は避けられず、省けるのは音声 VAE のデコードだけ。
+    """
+    # shift が指定されたときだけ SigmaShift を挟む（既定は公式テンプレートと同じ挙動）
+    model_node = "unet"
+    if shift_video is not None or shift_audio is not None:
+        prompt["sigma_shift"] = {
+            "class_type": "MiniMaxH3SigmaShift",
+            "inputs": {
+                "model": ["unet", 0],
+                "shift_video": DEFAULT_SHIFT_VIDEO if shift_video is None else shift_video,
+                "shift_audio": DEFAULT_SHIFT_AUDIO if shift_audio is None else shift_audio,
+            },
+        }
+        model_node = "sigma_shift"
+
     prompt["noise"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}}
     prompt["guider"] = {
         "class_type": "BasicGuider",
-        "inputs": {"model": ["unet", 0], "conditioning": [cond_node, 0]},
+        "inputs": {"model": [model_node, 0], "conditioning": [cond_node, 0]},
     }
     prompt["sampler"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": sampler}}
     prompt["sigmas"] = {
         "class_type": "BasicScheduler",
-        "inputs": {"model": ["unet", 0], "scheduler": scheduler, "steps": steps, "denoise": 1.0},
+        "inputs": {"model": [model_node, 0], "scheduler": scheduler,
+                   "steps": steps, "denoise": 1.0},
     }
     prompt["sample"] = {
         "class_type": "SamplerCustomAdvanced",
@@ -199,14 +234,23 @@ def _sampler_tail(prompt: dict, cond_node: str, steps: int, seed: int,
         "class_type": "VAEDecode",
         "inputs": {"samples": ["sample", 0], "vae": ["video_vae", 0]},
     }
-    prompt["decode_audio"] = {
-        "class_type": "VAEDecodeAudio",
-        "inputs": {"samples": ["sample", 0], "vae": ["audio_vae", 0]},
-    }
-    prompt["create_video"] = {
-        "class_type": "CreateVideo",
-        "inputs": {"images": ["decode_video", 0], "audio": ["decode_audio", 0], "fps": float(FPS)},
-    }
+    video_inputs = {"images": ["decode_video", 0], "fps": float(FPS)}
+    if audio or audio_format:
+        prompt["decode_audio"] = {
+            "class_type": "VAEDecodeAudio",
+            "inputs": {"samples": ["sample", 0], "vae": ["audio_vae", 0]},
+        }
+        if audio:
+            # CreateVideo の audio は optional。繋がなければ無音の動画になる
+            video_inputs["audio"] = ["decode_audio", 0]
+        if audio_format:
+            cls, _ext, extra = AUDIO_SAVE_NODES[audio_format]
+            prompt["save_audio"] = {
+                "class_type": cls,
+                "inputs": {"audio": ["decode_audio", 0],
+                           "filename_prefix": filename_prefix + "_audio", **extra},
+            }
+    prompt["create_video"] = {"class_type": "CreateVideo", "inputs": video_inputs}
     prompt["save"] = {
         "class_type": "SaveVideo",
         "inputs": {
@@ -231,6 +275,10 @@ def build_fl2va(
     scheduler: str = "simple",
     first_frame: str | None = None,
     last_frame: str | None = None,
+    audio: bool = True,
+    audio_format: str | None = None,
+    shift_video: float | None = None,
+    shift_audio: float | None = None,
     models: dict | None = None,
     filename_prefix: str = "minimax_h3/h3",
 ) -> dict:
@@ -254,7 +302,9 @@ def build_fl2va(
         cond_inputs["last_frame"] = ["last_frame", 0]
 
     prompt["cond"] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": cond_inputs}
-    return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix)
+    return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix,
+                         audio=audio, audio_format=audio_format,
+                         shift_video=shift_video, shift_audio=shift_audio)
 
 
 def build_ref2va(
@@ -269,6 +319,10 @@ def build_ref2va(
     scheduler: str = "simple",
     ref_images: list[str] | None = None,
     ref_image_size: str = "match",
+    audio: bool = True,
+    audio_format: str | None = None,
+    shift_video: float | None = None,
+    shift_audio: float | None = None,
     models: dict | None = None,
     filename_prefix: str = "minimax_h3/h3_ref",
 ) -> dict:
@@ -300,4 +354,6 @@ def build_ref2va(
         cond_inputs["ref_images"] = autogrow
 
     prompt["cond"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": cond_inputs}
-    return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix)
+    return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix,
+                         audio=audio, audio_format=audio_format,
+                         shift_video=shift_video, shift_audio=shift_audio)

@@ -49,6 +49,9 @@
   input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  label.check { display: flex; align-items: center; gap: 7px; color: var(--fg);
+                font-size: 13px; margin: 4px 0 0; cursor: pointer; }
+  label.check input { width: auto; margin: 0; }
 
   details { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 10px; }
   summary { cursor: pointer; color: var(--muted); font-size: 12px; }
@@ -174,6 +177,30 @@
     <select id="sampler"></select>
     <label for="scheduler">スケジューラ</label>
     <select id="scheduler"></select>
+
+    <label>音声</label>
+    <label class="check"><input type="checkbox" id="audio" checked>
+      動画に音声トラックを入れる</label>
+    <div class="hint">映像と音声は単一 forward で同時に作られるため、
+    音声の生成自体は省けません。外すと無音の動画になります。</div>
+
+    <label for="audiofmt">音声を別ファイルでも出力</label>
+    <select id="audiofmt">
+      <option value="">出力しない</option>
+    </select>
+
+    <div class="row">
+      <div>
+        <label for="shiftv">shift_video</label>
+        <input type="number" id="shiftv" step="0.5" placeholder="既定">
+      </div>
+      <div>
+        <label for="shifta">shift_audio</label>
+        <input type="number" id="shifta" step="0.5" placeholder="既定">
+      </div>
+    </div>
+    <div class="hint" id="shifthint">映像と音声それぞれの flow shift。
+    空欄なら SigmaShift ノード自体を挟まず、モデル本来の挙動になります。</div>
   </details>
 
   <button id="go">生成する</button>
@@ -360,6 +387,20 @@ async function loadConfig() {
   }
   // 長さのスライダーは API の許容範囲 (0.2〜20秒) ではなく、モデルの学習範囲
   // 5〜15秒のままにしておく。学習範囲外も試したい場合は API を直接叩く。
+  if (L.audio_formats) {
+    $("#audiofmt").innerHTML = '<option value="">出力しない</option>'
+      + L.audio_formats.map((f) => `<option value="${f}">${f}</option>`).join("");
+  }
+  if (L.shift) {
+    for (const [id, def] of [["#shiftv", L.shift.default_video],
+                             ["#shifta", L.shift.default_audio]]) {
+      $(id).min = L.shift.min; $(id).max = L.shift.max; $(id).placeholder = `既定 ${def}`;
+    }
+    $("#shifthint").textContent =
+      `映像と音声それぞれの flow shift（${L.shift.min}〜${L.shift.max}、`
+      + `既定 ${L.shift.default_video} / ${L.shift.default_audio}）。`
+      + `空欄なら SigmaShift ノード自体を挟まず、モデル本来の挙動になります。`;
+  }
   if (L.dimension) {
     for (const id of ["#cw", "#ch"]) {
       $(id).min = L.dimension.min; $(id).max = L.dimension.max;
@@ -386,6 +427,10 @@ $("#go").addEventListener("click", async () => {
     sampler: $("#sampler").value,
     scheduler: $("#scheduler").value,
     seed: $("#seed").value.trim() || null,
+    audio: $("#audio").checked,
+    audio_format: $("#audiofmt").value || null,
+    shift_video: $("#shiftv").value.trim() ? parseFloat($("#shiftv").value) : null,
+    shift_audio: $("#shifta").value.trim() ? parseFloat($("#shifta").value) : null,
   };
   if (MODE === "i2v") {
     if (!flFiles.length) return alert("先頭フレームの画像を追加してください");
@@ -454,10 +499,13 @@ function watch(job) {
       const r = s.request || {};
       setStatus(`完了 — ${el} / seed ${r.seed} / ${r.seconds}秒 ${r.length}フレーム`, false);
       $("#bar").firstElementChild.style.width = "100%";
+      const audioLink = s.audio_url
+        ? ` · <a href="${s.audio_url}?download=1">音声のみ (${r.audio_format})</a>` : "";
+      const mute = r.audio === false ? " · 無音" : "";
       $("#result").innerHTML = `
         <video src="${s.video_url}" controls autoplay loop></video>
-        <div class="meta">seed ${r.seed} · ${r.width}x${r.height} · ${r.seconds}秒 (${r.length}f) ·
-          <a href="${s.video_url}" download>ダウンロード</a></div>`;
+        <div class="meta">seed ${r.seed} · ${r.width}x${r.height} · ${r.seconds}秒 (${r.length}f)${mute} ·
+          <a href="${s.video_url}?download=1">ダウンロード</a>${audioLink}</div>`;
       finish(); return;
     }
     if (s.status === "queued") {

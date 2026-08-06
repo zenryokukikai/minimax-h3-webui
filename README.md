@@ -210,7 +210,8 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 | `POST` | `/v1/generate` | 生成を投入。既定は非同期で即 id を返す |
 | `GET` | `/v1/jobs` | 最近のジョブ一覧（`?limit=`） |
 | `GET` | `/v1/jobs/{id}` | 状態・進捗・完了時の `video_url` |
-| `GET` | `/v1/jobs/{id}/video` | mp4（音声つき）。`?download=1` で添付ダウンロード |
+| `GET` | `/v1/jobs/{id}/video` | mp4。`?download=1` で添付ダウンロード |
+| `GET` | `/v1/jobs/{id}/audio` | 音声のみ（`audio_format` 指定時） |
 | `POST` | `/v1/jobs/{id}/cancel` | キューから外す、または実行中なら中断 |
 | `GET` | `/v1/queue` | キューの現況 |
 | `GET` | `/healthz` | ヘルスチェック |
@@ -229,6 +230,9 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 | `first_frame` `last_frame` | — | `mode=i2v`。`/v1/images` が返す `ref` |
 | `ref_images` | — | `mode=ref2v`。最大9枚。プロンプト中で `<Picture 1>` … と参照 |
 | `ref_image_size` | `match` | `max` は同一性重視だが数倍遅い |
+| `audio` | `true` | `false` で出力動画を無音にする（音声の生成自体は省けない、下記参照） |
+| `audio_format` | — | `flac` / `mp3` / `opus`。指定すると音声だけのファイルも出力し `audio_url` が返る |
+| `shift_video` `shift_audio` | — | 映像・音声それぞれの flow shift（0.01〜100、既定 12.0 / 3.0）。どちらか指定した場合のみ `MiniMaxH3SigmaShift` を挟む |
 | `wait` `timeout` | `false` / 1800 | `true` で完了までブロック |
 
 エラーは HTTP ステータスと `{"error": {"code", "message"}}` で返ります。
@@ -237,6 +241,27 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 `GET /v1/options` の `limits` から取得できます。Web UI の入力欄の
 min/max もここから流し込まれるので、UI と API の食い違いは起きません。
 `steps` の上限を変えたいときはサーバ側だけ書き換えれば UI も追従します。
+
+### 音声について
+
+H3 は**映像と音声を単一の forward で同時に生成します**。音声だけを止めて
+速くする、という選択肢はありません（`EmptyMiniMaxH3LatentAV` が常に
+映像＋音声の latent を作ります）。
+
+できるのは次の3つです。
+
+- **無音の動画にする** — `"audio": false`。`CreateVideo` の `audio` 入力を
+  繋がないだけなので、省けるのは音声 VAE のデコード分だけです。実測でも
+  352x192 / 20ステップで 12.7秒 → 12.2秒とほぼ変わりません。
+- **音声だけ取り出す** — `"audio_format": "mp3"` などを指定すると
+  `audio_url` が返り、`GET /v1/jobs/{id}/audio` で音声単体
+  （32kHz ステレオ）を取得できます。動画側の音声トラックはそのまま残ります。
+- **音声の内容を指示する** — プロンプトに書きます。セリフ・効果音・BGM を
+  時刻つきで指定できます（「音: 雨音、2秒地点で雷鳴」）。
+
+`shift_video` / `shift_audio` は映像と音声で別々の flow shift を与える
+パラメータです（`MiniMaxH3SigmaShift`）。未指定ならノード自体を挟まないので、
+公式テンプレートと同じ挙動になります。
 
 ### 認証
 
@@ -348,6 +373,8 @@ tools/
   h3_client.py         API の Python クライアント兼 CLI（標準ライブラリのみ）
   sweep_resolution.py  解像度ごとのコストと画質を実測する
   test_queue.py        キューイングの結合テスト
+  test_audio.py        音声まわり（無音・音声単体出力）の結合テスト
+  sweep_steps.py       ステップ数ごとの所要時間を実測する
 ```
 
 公式ワークフローテンプレート (`video_minimax_h3_{t2v,i2v,r2v}.json`) のサブグラフを
