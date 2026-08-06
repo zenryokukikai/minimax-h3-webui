@@ -205,7 +205,7 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 
 | メソッド | パス | 用途 |
 |---|---|---|
-| `GET` | `/v1/options` | 解像度プリセット・サンプラー・コスト式・モデル配置状況 |
+| `GET` | `/v1/options` | 解像度プリセット・サンプラー・コスト式・入力の許容範囲・モデル配置状況 |
 | `POST` | `/v1/images` | 参照画像を登録して `ref` を得る（multipart の `file`、または JSON の `data` に base64） |
 | `POST` | `/v1/generate` | 生成を投入。既定は非同期で即 id を返す |
 | `GET` | `/v1/jobs` | 最近のジョブ一覧（`?limit=`） |
@@ -223,7 +223,7 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 | `mode` | `t2v` | `t2v` / `i2v` / `ref2v` |
 | `width` `height` | 864 / 480 | 32の倍数に丸められる |
 | `seconds` | 5 | 24fps の 17k+5 フレーム格子に切り上げ |
-| `steps` | 20 | |
+| `steps` | 20 | 1〜10000（ComfyUI の BasicScheduler と同じ範囲）。既定の 20 は公式テンプレートの値 |
 | `seed` | ランダム | 省略・`null`・`-1` でランダム |
 | `sampler` `scheduler` | `res_multistep` / `simple` | |
 | `first_frame` `last_frame` | — | `mode=i2v`。`/v1/images` が返す `ref` |
@@ -232,6 +232,11 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 | `wait` `timeout` | `false` / 1800 | `true` で完了までブロック |
 
 エラーは HTTP ステータスと `{"error": {"code", "message"}}` で返ります。
+
+入力の許容範囲はサーバの `LIMITS`（`app/server.py`）が唯一の定義箇所で、
+`GET /v1/options` の `limits` から取得できます。Web UI の入力欄の
+min/max もここから流し込まれるので、UI と API の食い違いは起きません。
+`steps` の上限を変えたいときはサーバ側だけ書き換えれば UI も追従します。
 
 ### 認証
 

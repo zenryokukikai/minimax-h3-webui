@@ -35,6 +35,17 @@ API_VERSION = "1.0.0"
 # 完了済みジョブをこの件数だけ保持する（メモリ上のみ。再起動で消える）
 MAX_JOBS = 200
 
+# 入力の許容範囲。ここが唯一の定義箇所で、Web UI は /v1/options 経由で
+# この値を読んで入力欄の min/max に反映する（UI 側に数字を持たせない）。
+# ステップ数の上限は ComfyUI の BasicScheduler に合わせてある。
+# モデル側にステップ数の制約はなく、既定の 20 は公式テンプレートの値。
+LIMITS = {
+    "steps": {"min": 1, "max": 10000, "default": 20},
+    "seconds": {"min": 0.2, "max": 20, "default": 5},
+    "dimension": {"min": 32, "max": 4096},
+    "ref_images": {"min": 1, "max": 9},
+}
+
 JOBS: "dict[str, dict]" = {}
 
 
@@ -314,16 +325,19 @@ def parse_request(body: dict) -> dict:
     if mode not in ("t2v", "i2v", "ref2v"):
         raise ApiError(400, "invalid_mode", "mode は t2v / i2v / ref2v のいずれかです")
 
-    width = workflows.snap_dimension(_int(body, "width", 864, 32, 4096))
-    height = workflows.snap_dimension(_int(body, "height", 480, 32, 4096))
+    dim = LIMITS["dimension"]
+    width = workflows.snap_dimension(_int(body, "width", 864, dim["min"], dim["max"]))
+    height = workflows.snap_dimension(_int(body, "height", 480, dim["min"], dim["max"]))
 
-    seconds = body.get("seconds", 5)
+    sec_lim = LIMITS["seconds"]
+    seconds = body.get("seconds", sec_lim["default"])
     try:
         seconds = float(seconds)
     except (TypeError, ValueError):
         raise ApiError(400, "invalid_parameter", "seconds は数値で指定してください")
-    if not 0.2 <= seconds <= 20:
-        raise ApiError(400, "invalid_parameter", "seconds は 0.2〜20 の範囲で指定してください")
+    if not sec_lim["min"] <= seconds <= sec_lim["max"]:
+        raise ApiError(400, "invalid_parameter",
+                       f"seconds は {sec_lim['min']}〜{sec_lim['max']} の範囲で指定してください")
 
     seed = body.get("seed")
     if seed in (None, "", -1):
@@ -338,7 +352,8 @@ def parse_request(body: dict) -> dict:
         "height": height,
         "seconds": seconds,
         "length": workflows.seconds_to_length(seconds),
-        "steps": _int(body, "steps", 20, 1, 200),
+        "steps": _int(body, "steps", LIMITS["steps"]["default"],
+                      LIMITS["steps"]["min"], LIMITS["steps"]["max"]),
         "seed": seed,
         "sampler": body.get("sampler") or "res_multistep",
         "scheduler": body.get("scheduler") or "simple",
@@ -353,8 +368,9 @@ def parse_request(body: dict) -> dict:
         refs = body.get("ref_images") or []
         if not isinstance(refs, list) or not refs:
             raise ApiError(400, "missing_image", "mode=ref2v には ref_images が必要です")
-        if len(refs) > 9:
-            raise ApiError(400, "too_many_images", "ref_images は最大9枚です")
+        if len(refs) > LIMITS["ref_images"]["max"]:
+            raise ApiError(400, "too_many_images",
+                           f"ref_images は最大{LIMITS['ref_images']['max']}枚です")
         req["ref_images"] = refs
         size = body.get("ref_image_size", "match")
         if size not in ("match", "max"):
@@ -454,7 +470,7 @@ async def v1_options(request):
             "video_vae": d["video_vae"] in vaes,
             "audio_vae": d["audio_vae"] in vaes,
         },
-        "limits": {"max_ref_images": 9, "fps": workflows.FPS,
+        "limits": {**LIMITS, "fps": workflows.FPS,
                    "canvas_multiple": workflows.CANVAS_MULTIPLE},
     })
 
