@@ -100,8 +100,9 @@ class H3Client:
     def cancel(self, job_id: str) -> dict:
         return self._request("POST", f"/v1/jobs/{job_id}/cancel")
 
-    def download(self, job_id: str, dest: str) -> str:
-        blob = self._request("GET", f"/v1/jobs/{job_id}/video", raw=True, timeout=600)
+    def download(self, job_id: str, dest: str, kind: str = "video") -> str:
+        """成果物を保存する。kind は video / audio / image。"""
+        blob = self._request("GET", f"/v1/jobs/{job_id}/{kind}", raw=True, timeout=600)
         with open(dest, "wb") as f:
             f.write(blob)
         return dest
@@ -143,11 +144,16 @@ def main(argv=None) -> int:
     g = sub.add_parser("generate", help="動画を生成する")
     g.add_argument("prompt")
     g.add_argument("-o", "--out", help="保存先。省略すると保存せず job id だけ表示")
-    g.add_argument("--mode", default="t2v", choices=["t2v", "i2v", "ref2v"])
+    g.add_argument("--mode", default="t2v", choices=["t2v", "i2v", "ref2v", "t2i"])
+    g.add_argument("--prep-image", action="store_true",
+                   help="参照用の静止画を先に生成してから動画にする")
+    g.add_argument("--prep-prompt", default=None,
+                   help="静止画用のプロンプト（省略時は動画と同じ）")
     g.add_argument("--width", type=int, default=864)
     g.add_argument("--height", type=int, default=480)
     g.add_argument("--seconds", type=float, default=5)
-    g.add_argument("--steps", type=int, default=20)
+    g.add_argument("--steps", type=int, default=None,
+                   help="省略時はサーバ側のモード別既定（動画20 / 静止画28）")
     g.add_argument("--seed", type=int, default=None)
     g.add_argument("--sampler", default=None)
     g.add_argument("--scheduler", default=None)
@@ -160,9 +166,10 @@ def main(argv=None) -> int:
     s = sub.add_parser("status", help="ジョブの状態を表示")
     s.add_argument("job_id")
 
-    d = sub.add_parser("download", help="生成済み動画を保存")
+    d = sub.add_parser("download", help="生成済みの成果物を保存")
     d.add_argument("job_id")
     d.add_argument("-o", "--out", required=True)
+    d.add_argument("--kind", default="video", choices=["video", "audio", "image"])
 
     c = sub.add_parser("cancel", help="実行中のジョブを中断")
     c.add_argument("job_id")
@@ -199,13 +206,18 @@ def main(argv=None) -> int:
             return 0
 
         if args.cmd == "download":
-            print(client.download(args.job_id, args.out))
+            print(client.download(args.job_id, args.out, args.kind))
             return 0
 
         # generate
         params = {"mode": args.mode, "width": args.width, "height": args.height,
-                  "seconds": args.seconds, "steps": args.steps,
+                  "seconds": args.seconds,
                   "ref_image_size": args.ref_image_size}
+        if args.steps is not None:
+            params["steps"] = args.steps
+        if args.prep_image:
+            params["prep_image"] = ({"prompt": args.prep_prompt}
+                                    if args.prep_prompt else True)
         if args.seed is not None:
             params["seed"] = args.seed
         if args.sampler:
@@ -241,7 +253,11 @@ def main(argv=None) -> int:
             print(f"失敗: {final.get('error', final['status'])}", file=sys.stderr)
             return 1
         if args.out:
-            print(client.download(job["id"], args.out))
+            kind = "image" if args.mode == "t2i" else "video"
+            print(client.download(job["id"], args.out, kind))
+            if args.prep_image and final.get("image_url"):
+                ref = args.out.rsplit(".", 1)[0] + "_ref.png"
+                print(client.download(job["id"], ref, "image"))
         else:
             print(job["id"])
         return 0

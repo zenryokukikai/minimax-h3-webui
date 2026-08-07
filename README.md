@@ -126,6 +126,69 @@ NVFP4 がネイティブで動くぶんファイルサイズが約半分（46GB 
 なお公開されている DGX Spark のベンチではもっと遅い数字（5秒480pで6分程度）も
 報告されていますが、それらは量子化形式やバックエンドが最適でない構成と思われます。
 
+## 参照静止画を先に作ってから動画にする
+
+動画生成は構図や被写体が毎回ぶれます。**先に静止画を作り、それを先頭フレーム
+（または `<Picture 1>` 参照）として動画にすると安定します**。
+
+`prep_image` を付けるだけで、**静止画生成と動画生成が1つの ComfyUI グラフに
+組み上がります**。生成された IMAGE が MiniMax-H3 の入力へ直結されるので、
+中間ファイルの保存・再アップロードは発生せず、キューにも1件しか積まれません。
+
+```bash
+curl -sX POST http://your-host:18190/v1/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"雨の夜の路地を傘の人物が歩き、振り返る。音: 雨音と遠くの雷",
+       "width":864,"height":480,"prep_image":true}'
+```
+
+完了すると `video_url` に加えて **`image_url`（参照に使った静止画）** も返ります。
+
+```bash
+python tools/h3_client.py generate "..." --prep-image -o out.mp4
+# out.mp4 と out_ref.png が保存される
+```
+
+細かく指定する場合:
+
+```json
+{"prep_image": {
+   "prompt": "静止画だけ別のプロンプトにしたい場合",
+   "steps": 28, "seed": 12345,
+   "width": 1344, "height": 736
+}}
+```
+
+省略時は動画と同じプロンプト、動画のアスペクト比を保った約1MPの解像度、
+28ステップ、ランダムシードになります。動画側が 352x192 のような下書き解像度
+でも、参照画像は約1MPで作られます（H3 側が内部で縮小するため）。
+
+**実測（A100 80GB, 864x480 / 5.17秒）**
+
+| | 所要時間 | VRAM ピーク |
+|---|---|---|
+| 動画のみ | 110秒 | 53 GB |
+| 静止画 → 動画 | **118秒** | 69 GB |
+
+静止画の上乗せは **8秒だけ**です（HiDream-O1 は LCM 系の少ステップモデルで、
+1344x768 の単体生成なら 4.2秒）。
+
+## 静止画生成 (HiDream-O1)
+
+`mode: "t2i"` で静止画だけを作れます。取得は `GET /v1/jobs/{id}/image`。
+
+```bash
+python tools/h3_client.py generate "プロンプト" --mode t2i --width 2048 --height 1152 -o out.png
+```
+
+使うモデルは [Comfy-Org/HiDream-O1-Image](https://huggingface.co/Comfy-Org/HiDream-O1-Image) の
+`hidream_o1_image_dev_bf16.safetensors`（16.4GB、`models/checkpoints/` に配置）です。
+8.2B・MIT ライセンスで、オープンウェイトの T2I リーダーボードでは
+64.6B の Cosmos3-Super に Elo 31 差まで迫っています。
+
+Ampere では FP8/MXFP8 版はエミュレーションになるので **BF16 を選んでください**
+（A100 80GB なら MiniMax-H3 と同時常駐しても収まります）。
+
 ## API
 
 Web UI と同じ `/v1` を、そのままプログラムから呼べます（UI 自身がこの API の
@@ -212,6 +275,7 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 | `GET` | `/v1/jobs/{id}` | 状態・進捗・完了時の `video_url` |
 | `GET` | `/v1/jobs/{id}/video` | mp4。`?download=1` で添付ダウンロード |
 | `GET` | `/v1/jobs/{id}/audio` | 音声のみ（`audio_format` 指定時） |
+| `GET` | `/v1/jobs/{id}/image` | 静止画（`mode=t2i` / `prep_image` 使用時） |
 | `POST` | `/v1/jobs/{id}/cancel` | キューから外す、または実行中なら中断 |
 | `GET` | `/v1/queue` | キューの現況 |
 | `GET` | `/healthz` | ヘルスチェック |
@@ -221,7 +285,7 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 | キー | 既定 | 説明 |
 |---|---|---|
 | `prompt` | 必須 | 映像と音の内容。音の指示もここに書く |
-| `mode` | `t2v` | `t2v` / `i2v` / `ref2v` |
+| `mode` | `t2v` | `t2v` / `i2v` / `ref2v` / `t2i`（静止画のみ） |
 | `width` `height` | 864 / 480 | 32の倍数に丸められる |
 | `seconds` | 5 | 24fps の 17k+5 フレーム格子に切り上げ |
 | `steps` | 20 | 1〜10000（ComfyUI の BasicScheduler と同じ範囲）。既定の 20 は公式テンプレートの値 |
@@ -230,6 +294,7 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 | `first_frame` `last_frame` | — | `mode=i2v`。`/v1/images` が返す `ref` |
 | `ref_images` | — | `mode=ref2v`。最大9枚。プロンプト中で `<Picture 1>` … と参照 |
 | `ref_image_size` | `match` | `max` は同一性重視だが数倍遅い |
+| `prep_image` | `false` | `true` か設定オブジェクト。参照用の静止画を先に生成して先頭フレーム（ref2v では `<Picture 1>`）に使う |
 | `audio` | `true` | `false` で出力動画を無音にする（音声の生成自体は省けない、下記参照） |
 | `audio_format` | — | `flac` / `mp3` / `opus`。指定すると音声だけのファイルも出力し `audio_url` が返る |
 | `shift_video` `shift_audio` | — | 映像・音声それぞれの flow shift（0.01〜100、既定 12.0 / 3.0）。どちらか指定した場合のみ `MiniMaxH3SigmaShift` を挟む |

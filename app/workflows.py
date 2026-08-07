@@ -31,6 +31,20 @@ _BUILTIN_MODELS = {
     "clip": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
     "video_vae": "minimax_h3_video_vae_fp16.safetensors",
     "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+    # 静止画生成 (HiDream-O1)。動画の参照画像を作るのにも使う。
+    # A100 のような Ampere では FP8/MXFP8 がエミュレーションになるので BF16 を選ぶ。
+    "image_checkpoint": "hidream_o1_image_dev_bf16.safetensors",
+}
+
+# HiDream-O1 Dev の既定サンプリング設定（公式テンプレート image_hidream_o1_dev.json）
+IMAGE_DEFAULTS = {
+    "steps": 28,
+    "cfg": 1.0,
+    "scheduler": "normal",
+    "noise_scale": 7.6,      # ModelNoiseScale
+    "lcm_s_noise": 1.0,
+    "lcm_s_noise_end": 1.0,
+    "lcm_noise_clip_std": 2.5,
 }
 
 
@@ -144,6 +158,29 @@ def resolution_options() -> list[dict]:
     return out
 
 
+# HiDream-O1 は 2K ネイティブ。動画側と違い時間軸が無いので画素数だけが効く。
+IMAGE_RESOLUTION_PRESETS = [
+    {"width": 2048, "height": 2048, "note": "ネイティブ 2K・正方形"},
+    {"width": 2048, "height": 1152, "note": "ネイティブ 2K・横"},
+    {"width": 1152, "height": 2048, "note": "ネイティブ 2K・縦"},
+    {"width": 1344, "height": 768, "note": "動画のネイティブ解像度に一致"},
+    {"width": 768, "height": 1344, "note": "動画のネイティブ解像度に一致・縦"},
+    {"width": 1024, "height": 1024, "note": "軽量・正方形"},
+    {"width": 1344, "height": 896, "note": ""},
+    {"width": 896, "height": 1344, "note": "縦"},
+]
+
+
+def image_resolution_options() -> list[dict]:
+    out = []
+    for p in IMAGE_RESOLUTION_PRESETS:
+        label = f"{_aspect(p['width'], p['height']):>5}  {p['width']}x{p['height']}".ljust(22)
+        if p["note"]:
+            label += "  " + p["note"]
+        out.append({**p, "label": label})
+    return out
+
+
 def seconds_to_length(seconds: float) -> int:
     """秒数を H3 が受け付けるフレーム長 (24fps, 17k+5 グリッド) に切り上げる。
 
@@ -175,6 +212,102 @@ def _loaders(unet_name: str, clip_name: str, video_vae: str, audio_vae: str) -> 
         "video_vae": {"class_type": "VAELoader", "inputs": {"vae_name": video_vae}},
         "audio_vae": {"class_type": "VAELoader", "inputs": {"vae_name": audio_vae}},
     }
+
+
+def image_size_for(width: int, height: int, megapixels: float = 1.0) -> "tuple[int, int]":
+    """動画のアスペクト比を保ったまま、参照画像に適した画素数へ拡大する。
+
+    352x192 のような下書き解像度で参照画像まで作ると、静止画側の品質が
+    落ちて参照の意味がなくなる。H3 側は参照画像を内部で縮小するので、
+    アスペクト比だけ合わせて画素数は上げておく。
+    """
+    scale = (megapixels * 1_000_000 / (width * height)) ** 0.5
+    return snap_dimension(round(width * scale)), snap_dimension(round(height * scale))
+
+
+def _image_branch(prompt: dict, *, checkpoint: str, prompt_text: str, negative: str,
+                  width: int, height: int, seed: int, steps: int,
+                  save: bool, filename_prefix: str, prefix: str = "img_") -> str:
+    """HiDream-O1 で静止画を作る部分を組み立て、IMAGE を出すノード名を返す。
+
+    動画ワークフローに直接埋め込めるように、ノード名に接頭辞を付けて
+    MiniMax-H3 側のノードと衝突しないようにしている。埋め込んだ場合は
+    生成された IMAGE をそのまま first_frame / ref_images へ繋げられるので、
+    中間ファイルの受け渡しが要らない（ComfyUI のキューにも1件しか積まれない）。
+    """
+    d = IMAGE_DEFAULTS
+    n = lambda k: prefix + k  # noqa: E731
+
+    prompt[n("ckpt")] = {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {"ckpt_name": checkpoint},
+    }
+    prompt[n("model")] = {
+        "class_type": "ModelNoiseScale",
+        "inputs": {"model": [n("ckpt"), 0], "noise_scale": d["noise_scale"]},
+    }
+    prompt[n("pos")] = {
+        "class_type": "CLIPTextEncode",
+        "inputs": {"text": prompt_text, "clip": [n("ckpt"), 1]},
+    }
+    prompt[n("neg")] = {
+        "class_type": "CLIPTextEncode",
+        "inputs": {"text": negative, "clip": [n("ckpt"), 1]},
+    }
+    prompt[n("latent")] = {
+        "class_type": "EmptyHiDreamO1LatentImage",
+        "inputs": {"width": snap_dimension(width), "height": snap_dimension(height),
+                   "batch_size": 1},
+    }
+    prompt[n("sigmas")] = {
+        "class_type": "BasicScheduler",
+        "inputs": {"model": [n("model"), 0], "scheduler": d["scheduler"],
+                   "steps": steps, "denoise": 1.0},
+    }
+    prompt[n("sampler")] = {
+        "class_type": "SamplerLCM",
+        "inputs": {"s_noise": d["lcm_s_noise"], "s_noise_end": d["lcm_s_noise_end"],
+                   "noise_clip_std": d["lcm_noise_clip_std"]},
+    }
+    prompt[n("sample")] = {
+        "class_type": "SamplerCustom",
+        "inputs": {
+            "model": [n("model"), 0], "add_noise": True, "noise_seed": seed,
+            "cfg": d["cfg"], "positive": [n("pos"), 0], "negative": [n("neg"), 0],
+            "sampler": [n("sampler"), 0], "sigmas": [n("sigmas"), 0],
+            "latent_image": [n("latent"), 0],
+        },
+    }
+    prompt[n("decode")] = {
+        "class_type": "VAEDecode",
+        "inputs": {"samples": [n("sample"), 0], "vae": [n("ckpt"), 2]},
+    }
+    if save:
+        prompt[n("save")] = {
+            "class_type": "SaveImage",
+            "inputs": {"images": [n("decode"), 0], "filename_prefix": filename_prefix},
+        }
+    return n("decode")
+
+
+def build_t2i(
+    *,
+    prompt_text: str,
+    width: int = 2048,
+    height: int = 2048,
+    seed: int,
+    steps: int = IMAGE_DEFAULTS["steps"],
+    negative: str = "",
+    models: dict | None = None,
+    filename_prefix: str = "hidream_o1/img",
+) -> dict:
+    """静止画のみを生成する（HiDream-O1）。"""
+    m = {**DEFAULT_MODELS, **(models or {})}
+    prompt: dict = {}
+    _image_branch(prompt, checkpoint=m["image_checkpoint"], prompt_text=prompt_text,
+                  negative=negative, width=width, height=height, seed=seed,
+                  steps=steps, save=True, filename_prefix=filename_prefix)
+    return prompt
 
 
 # 音声を別ファイルでも出す場合の形式。SaveAudio は FLAC を書く。
@@ -275,6 +408,7 @@ def build_fl2va(
     scheduler: str = "simple",
     first_frame: str | None = None,
     last_frame: str | None = None,
+    prep_image: dict | None = None,
     audio: bool = True,
     audio_format: str | None = None,
     shift_video: float | None = None,
@@ -297,6 +431,17 @@ def build_fl2va(
     if first_frame:
         prompt["first_frame"] = {"class_type": "LoadImage", "inputs": {"image": first_frame}}
         cond_inputs["first_frame"] = ["first_frame", 0]
+    elif prep_image:
+        # 参照用の静止画を同じグラフ内で先に作り、その IMAGE を直接繋ぐ。
+        # 中間ファイルの往復が無く、ComfyUI のキューにも1件しか積まれない。
+        node = _image_branch(
+            prompt, checkpoint=m["image_checkpoint"],
+            prompt_text=prep_image["prompt"], negative=prep_image.get("negative", ""),
+            width=prep_image["width"], height=prep_image["height"],
+            seed=prep_image["seed"], steps=prep_image["steps"],
+            save=prep_image.get("save", True),
+            filename_prefix=filename_prefix + "_ref")
+        cond_inputs["first_frame"] = [node, 0]
     if last_frame:
         prompt["last_frame"] = {"class_type": "LoadImage", "inputs": {"image": last_frame}}
         cond_inputs["last_frame"] = ["last_frame", 0]
@@ -319,6 +464,7 @@ def build_ref2va(
     scheduler: str = "simple",
     ref_images: list[str] | None = None,
     ref_image_size: str = "match",
+    prep_image: dict | None = None,
     audio: bool = True,
     audio_format: str | None = None,
     shift_video: float | None = None,
@@ -346,10 +492,22 @@ def build_ref2va(
 
     # Autogrow 入力は {"<prefix><n>": <link>} という辞書で渡す
     autogrow = {}
+    slot = 0
+    if prep_image:
+        # 生成した静止画を <Picture 1> として先頭に置く
+        node = _image_branch(
+            prompt, checkpoint=m["image_checkpoint"],
+            prompt_text=prep_image["prompt"], negative=prep_image.get("negative", ""),
+            width=prep_image["width"], height=prep_image["height"],
+            seed=prep_image["seed"], steps=prep_image["steps"],
+            save=prep_image.get("save", True),
+            filename_prefix=filename_prefix + "_ref")
+        autogrow["ref_image_0"] = [node, 0]
+        slot = 1
     for i, name in enumerate(ref_images or []):
-        node_id = f"ref_image_{i}"
+        node_id = f"ref_image_{slot + i}"
         prompt[node_id] = {"class_type": "LoadImage", "inputs": {"image": name}}
-        autogrow[f"ref_image_{i}"] = [node_id, 0]
+        autogrow[f"ref_image_{slot + i}"] = [node_id, 0]
     if autogrow:
         cond_inputs["ref_images"] = autogrow
 

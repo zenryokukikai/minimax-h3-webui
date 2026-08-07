@@ -108,6 +108,7 @@
     <button data-mode="t2v" class="on">テキスト→動画</button>
     <button data-mode="i2v">画像→動画</button>
     <button data-mode="ref2v">参照画像</button>
+    <button data-mode="t2i">画像生成</button>
   </div>
 
   <label for="prompt">プロンプト</label>
@@ -138,6 +139,26 @@
     </select>
   </div>
 
+  <div id="preppane">
+    <label class="check"><input type="checkbox" id="prep">
+      参照用の静止画を先に生成してから動画にする</label>
+    <div class="hint">HiDream-O1 で静止画を作り、その画像を先頭フレーム
+    （参照画像モードでは <code>&lt;Picture 1&gt;</code>）として動画生成に渡します。
+    構図と被写体が固定されるぶん安定します。1つのジョブとして実行されるので
+    中間ファイルの受け渡しは不要です。</div>
+    <div id="prepopts" style="display:none">
+      <label for="prepprompt">静止画用プロンプト（空欄なら動画と同じ）</label>
+      <textarea id="prepprompt" style="min-height:70px"
+        placeholder="空欄なら動画のプロンプトをそのまま使います"></textarea>
+      <div class="row">
+        <div><label for="prepsteps">静止画のステップ数</label>
+          <input type="number" id="prepsteps"></div>
+        <div><label for="prepseed">静止画のシード</label>
+          <input type="text" id="prepseed" placeholder="ランダム"></div>
+      </div>
+    </div>
+  </div>
+
   <label for="res">解像度</label>
   <select id="res"></select>
   <div id="custom" style="display:none">
@@ -155,7 +176,7 @@
   </div>
 
   <div class="row">
-    <div>
+    <div id="seccol">
       <label for="sec">長さ <span id="seclabel">5.17秒</span></label>
       <input type="range" id="sec" min="5" max="15" step="0.5" value="5">
     </div>
@@ -178,6 +199,7 @@
     <label for="scheduler">スケジューラ</label>
     <select id="scheduler"></select>
 
+    <div id="audiopane">
     <label>音声</label>
     <label class="check"><input type="checkbox" id="audio" checked>
       動画に音声トラックを入れる</label>
@@ -201,6 +223,7 @@
     </div>
     <div class="hint" id="shifthint">映像と音声それぞれの flow shift。
     空欄なら SigmaShift ノード自体を挟まず、モデル本来の挙動になります。</div>
+    </div>
   </details>
 
   <button id="go">生成する</button>
@@ -263,9 +286,43 @@ document.querySelectorAll(".tabs button").forEach((b) => {
     document.querySelectorAll(".tabs button").forEach((x) => x.classList.remove("on"));
     b.classList.add("on");
     MODE = b.dataset.mode;
-    $("#imgpane").style.display = MODE === "i2v" ? "block" : "none";
-    $("#refpane").style.display = MODE === "ref2v" ? "block" : "none";
+    applyMode();
   });
+});
+
+function applyMode() {
+  const isImage = MODE === "t2i";
+  $("#imgpane").style.display = MODE === "i2v" ? "block" : "none";
+  $("#refpane").style.display = MODE === "ref2v" ? "block" : "none";
+  const hasT2I = !CFG || !CFG.ready || CFG.ready.t2i;
+  $("#preppane").style.display = (!isImage && hasT2I) ? "block" : "none";
+  // 静止画には長さも音声も無い
+  $("#seccol").style.display = isImage ? "none" : "block";
+  $("#stepshint").style.display = isImage ? "none" : "block";
+  $("#audiopane").style.display = isImage ? "none" : "block";
+  fillResolutions();
+  if (isImage && CFG && CFG.limits && CFG.limits.image_steps) {
+    $("#steps").value = CFG.limits.image_steps.default;
+    $("#steps").max = CFG.limits.image_steps.max;
+  } else if (CFG && CFG.limits && CFG.limits.steps) {
+    $("#steps").value = CFG.limits.steps.default;
+    $("#steps").max = CFG.limits.steps.max;
+  }
+  $("#go").textContent = isImage ? "画像を生成する" : "生成する";
+}
+
+function fillResolutions() {
+  if (!CFG) return;
+  const list = MODE === "t2i" ? CFG.image_resolutions : CFG.resolutions;
+  const keep = $("#res").value;
+  $("#res").innerHTML = list
+    .map((p) => `<option value="${p.width}x${p.height}">${p.label}</option>`).join("")
+    + `<option value="custom">カスタム（自由入力）</option>`;
+  if (keep && [...$("#res").options].some((o) => o.value === keep)) $("#res").value = keep;
+}
+
+$("#prep").addEventListener("change", () => {
+  $("#prepopts").style.display = $("#prep").checked ? "block" : "none";
 });
 
 async function upload(file) {
@@ -364,11 +421,7 @@ async function loadConfig() {
     return;
   }
   CFG = cfg;
-  const keep = $("#res").value;
-  $("#res").innerHTML = CFG.resolutions
-    .map((p) => `<option value="${p.width}x${p.height}">${p.label}</option>`).join("")
-    + `<option value="custom">カスタム（自由入力）</option>`;
-  if (keep) $("#res").value = keep;
+  fillResolutions();
   $("#sampler").innerHTML = CFG.samplers
     .map((s) => `<option${s === "res_multistep" ? " selected" : ""}>${s}</option>`).join("");
   $("#scheduler").innerHTML = CFG.schedulers
@@ -376,6 +429,11 @@ async function loadConfig() {
 
   // 入力の許容範囲はサーバが唯一の定義元。UI 側に数字を持たない
   const L = CFG.limits || {};
+  if (L.image_steps && !$("#prepsteps").value) {
+    $("#prepsteps").min = L.image_steps.min;
+    $("#prepsteps").max = L.image_steps.max;
+    $("#prepsteps").value = L.image_steps.default;
+  }
   if (L.steps) {
     const el = $("#steps");
     el.min = L.steps.min; el.max = L.steps.max;
@@ -413,7 +471,13 @@ async function loadConfig() {
   $("#health").innerHTML = missing.length
     ? `<b class="bad">未配置: ${missing.join(", ")}</b>`
     : `<b>モデル読込可</b>`;
-  $("#go").disabled = !(R.text_encoder && R.video_vae && R.audio_vae && (R.t2v || R.ref2v));
+  const videoOk = R.text_encoder && R.video_vae && R.audio_vae && (R.t2v || R.ref2v);
+  $("#go").disabled = MODE === "t2i" ? !R.t2i : !videoOk;
+  // 静止画モデルが無ければ画像タブと参照画像の自動生成を出さない
+  document.querySelector('.tabs button[data-mode="t2i"]').style.display =
+    R.t2i ? "" : "none";
+  $("#preppane").style.display =
+    (R.t2i && MODE !== "t2i") ? "block" : "none";
 }
 
 $("#go").addEventListener("click", async () => {
@@ -428,15 +492,21 @@ $("#go").addEventListener("click", async () => {
     scheduler: $("#scheduler").value,
     seed: $("#seed").value.trim() || null,
     audio: $("#audio").checked,
+    prep_image: (MODE !== "t2i" && $("#prep").checked) ? {
+      prompt: $("#prepprompt").value.trim() || null,
+      steps: parseInt($("#prepsteps").value, 10) || null,
+      seed: $("#prepseed").value.trim() || null,
+    } : false,
     audio_format: $("#audiofmt").value || null,
     shift_video: $("#shiftv").value.trim() ? parseFloat($("#shiftv").value) : null,
     shift_audio: $("#shifta").value.trim() ? parseFloat($("#shifta").value) : null,
   };
-  if (MODE === "i2v") {
-    if (!flFiles.length) return alert("先頭フレームの画像を追加してください");
+  if (MODE === "i2v" && !$("#prep").checked) {
+    if (!flFiles.length) return alert("先頭フレームの画像を追加するか、参照静止画の自動生成を有効にしてください");
     body.first_frame = flFiles[0].name;
     if (flFiles[1]) body.last_frame = flFiles[1].name;
   }
+  if (MODE === "i2v" && $("#prep").checked && flFiles[1]) body.last_frame = flFiles[1].name;
   if (MODE === "ref2v") {
     if (!refFiles.length) return alert("参照画像を1枚以上追加してください");
     body.ref_images = refFiles.map((f) => f.name);
@@ -499,13 +569,26 @@ function watch(job) {
       const r = s.request || {};
       setStatus(`完了 — ${el} / seed ${r.seed} / ${r.seconds}秒 ${r.length}フレーム`, false);
       $("#bar").firstElementChild.style.width = "100%";
+      if (r.mode === "t2i") {
+        setStatus(`完了 — ${el} / seed ${r.seed} / ${r.width}x${r.height}`, false);
+        $("#bar").firstElementChild.style.width = "100%";
+        $("#result").innerHTML = `
+          <img src="${s.image_url}" style="width:100%;border-radius:10px">
+          <div class="meta">seed ${r.seed} · ${r.width}x${r.height} ·
+            <a href="${s.image_url}?download=1">ダウンロード</a></div>`;
+        finish(); return;
+      }
       const audioLink = s.audio_url
         ? ` · <a href="${s.audio_url}?download=1">音声のみ (${r.audio_format})</a>` : "";
       const mute = r.audio === false ? " · 無音" : "";
+      const refLink = s.image_url
+        ? `<div class="meta" style="margin-top:6px">参照に使った静止画:
+             <a href="${s.image_url}" target="_blank">開く</a> ·
+             <a href="${s.image_url}?download=1">ダウンロード</a></div>` : "";
       $("#result").innerHTML = `
         <video src="${s.video_url}" controls autoplay loop></video>
         <div class="meta">seed ${r.seed} · ${r.width}x${r.height} · ${r.seconds}秒 (${r.length}f)${mute} ·
-          <a href="${s.video_url}?download=1">ダウンロード</a>${audioLink}</div>`;
+          <a href="${s.video_url}?download=1">ダウンロード</a>${audioLink}</div>${refLink}`;
       finish(); return;
     }
     if (s.status === "queued") {
@@ -521,7 +604,7 @@ function watch(job) {
   }, 1000);
 }
 
-loadConfig();
+loadConfig().then(applyMode);
 setInterval(loadConfig, 30000);
 $("#sec").dispatchEvent(new Event("input"));
 </script>

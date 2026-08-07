@@ -50,6 +50,11 @@ LIMITS = {
               "default_video": workflows.DEFAULT_SHIFT_VIDEO,
               "default_audio": workflows.DEFAULT_SHIFT_AUDIO},
     "audio_formats": sorted(workflows.AUDIO_SAVE_NODES),
+    # 静止画 (HiDream-O1)。2K ネイティブなので既定を大きめに取る。
+    "image_steps": {"min": 1, "max": 200,
+                    "default": workflows.IMAGE_DEFAULTS["steps"]},
+    "image_size": {"default_width": 1344, "default_height": 768,
+                   "reference_megapixels": 1.0},
 }
 
 JOBS: "dict[str, dict]" = {}
@@ -223,6 +228,7 @@ def job_view(job_id: str, job: dict) -> dict:
             "audio_format": job.get("audio_format"),
             "shift_video": job.get("shift_video"),
             "shift_audio": job.get("shift_audio"),
+            "prep_image": job.get("prep_image"),
         },
         "relative_cost": job.get("relative_cost"),
         "created_at": job.get("created_at"),
@@ -239,6 +245,9 @@ def job_view(job_id: str, job: dict) -> dict:
         out["video_url"] = job["video_url"]
     if job.get("audio_url"):
         out["audio_url"] = job["audio_url"]
+    if job.get("image_url"):
+        # prep_image を使った動画では、参照に使った静止画がここに入る
+        out["image_url"] = job["image_url"]
     if job.get("error"):
         out["error"] = job["error"]
     return out
@@ -307,8 +316,11 @@ async def refresh_from_history(comfy: Comfy, job_id: str, job: dict):
             elif low.endswith((".flac", ".mp3", ".opus", ".wav")):
                 job["audio_url"] = f"/v1/jobs/{job_id}/audio"
                 job["_comfy_audio"] = ref
+            elif low.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                job["image_url"] = f"/v1/jobs/{job_id}/image"
+                job["_comfy_image"] = ref
 
-    if job.get("video_url"):
+    if job.get("video_url") or (job.get("mode") == "t2i" and job.get("image_url")):
         job["status"] = "done"
         job.setdefault("finished_at", time.time())
         job["_event"].set()
@@ -331,6 +343,13 @@ def _int(body: dict, key: str, default: int, lo: int, hi: int) -> int:
     return v
 
 
+def _seed(body: dict, key: str = "seed") -> int:
+    v = body.get(key)
+    if v in (None, "", -1):
+        return random.randint(0, 2**63 - 1)
+    return _int({key: v}, key, 0, 0, 2**63 - 1)
+
+
 def parse_request(body: dict) -> dict:
     if not isinstance(body, dict):
         raise ApiError(400, "invalid_body", "JSON オブジェクトを送ってください")
@@ -340,14 +359,27 @@ def parse_request(body: dict) -> dict:
         raise ApiError(400, "missing_prompt", "prompt は必須です")
 
     mode = body.get("mode") or "t2v"
-    if mode not in ("t2v", "i2v", "ref2v"):
-        raise ApiError(400, "invalid_mode", "mode は t2v / i2v / ref2v のいずれかです")
+    if mode not in ("t2v", "i2v", "ref2v", "t2i"):
+        raise ApiError(400, "invalid_mode",
+                       "mode は t2v / i2v / ref2v / t2i のいずれかです")
 
     dim = LIMITS["dimension"]
     width = workflows.snap_dimension(_int(body, "width", 864, dim["min"], dim["max"]))
     height = workflows.snap_dimension(_int(body, "height", 480, dim["min"], dim["max"]))
 
     sec_lim = LIMITS["seconds"]
+    if mode == "t2i":
+        img_lim = LIMITS["image_steps"]
+        return {
+            "mode": "t2i",
+            "prompt": prompt,
+            "width": width if body.get("width") else LIMITS["image_size"]["default_width"],
+            "height": height if body.get("height") else LIMITS["image_size"]["default_height"],
+            "steps": _int(body, "steps", img_lim["default"], img_lim["min"], img_lim["max"]),
+            "seed": _seed(body),
+            "negative": body.get("negative") or "",
+        }
+
     seconds = body.get("seconds", sec_lim["default"])
     try:
         seconds = float(seconds)
@@ -356,12 +388,6 @@ def parse_request(body: dict) -> dict:
     if not sec_lim["min"] <= seconds <= sec_lim["max"]:
         raise ApiError(400, "invalid_parameter",
                        f"seconds は {sec_lim['min']}〜{sec_lim['max']} の範囲で指定してください")
-
-    seed = body.get("seed")
-    if seed in (None, "", -1):
-        seed = random.randint(0, 2**63 - 1)
-    else:
-        seed = _int({"seed": seed}, "seed", 0, 0, 2**63 - 1)
 
     req = {
         "prompt": prompt,
@@ -372,7 +398,7 @@ def parse_request(body: dict) -> dict:
         "length": workflows.seconds_to_length(seconds),
         "steps": _int(body, "steps", LIMITS["steps"]["default"],
                       LIMITS["steps"]["min"], LIMITS["steps"]["max"]),
-        "seed": seed,
+        "seed": _seed(body),
         "sampler": body.get("sampler") or "res_multistep",
         "scheduler": body.get("scheduler") or "simple",
     }
@@ -421,18 +447,57 @@ def parse_request(body: dict) -> dict:
                            f"{key} は {lim['min']}〜{lim['max']} の範囲です")
         req[key] = v
 
+    # 参照用の静止画を先に作ってから動画にするオプション。
+    # 同じ ComfyUI グラフに両方を入れて IMAGE を直結するので、
+    # 中間ファイルの受け渡しは発生せず、キューにも1件しか積まれない。
+    prep = body.get("prep_image")
+    if prep:
+        if prep is True:
+            prep = {}
+        if not isinstance(prep, dict):
+            raise ApiError(400, "invalid_parameter",
+                           "prep_image は true か設定オブジェクトで指定してください")
+        if mode == "i2v" and body.get("first_frame"):
+            raise ApiError(400, "invalid_parameter",
+                           "first_frame を指定した場合 prep_image は使えません")
+        img_lim = LIMITS["image_steps"]
+        iw, ih = workflows.image_size_for(
+            width, height, LIMITS["image_size"]["reference_megapixels"])
+        req["prep_image"] = {
+            # 既定では動画と同じプロンプトを使う（映像の記述がそのまま効く）
+            "prompt": (prep.get("prompt") or "").strip() or prompt,
+            "negative": prep.get("negative") or "",
+            "width": workflows.snap_dimension(int(prep.get("width") or iw)),
+            "height": workflows.snap_dimension(int(prep.get("height") or ih)),
+            "steps": _int(prep, "steps", img_lim["default"],
+                          img_lim["min"], img_lim["max"]),
+            "seed": _seed(prep),
+            "save": bool(prep.get("save", True)),
+        }
+        if mode == "i2v":
+            # 生成画像を先頭フレームにするので i2v と同じ扱いになる
+            req["mode"] = mode = "i2v"
+    else:
+        req["prep_image"] = None
+
     req["seconds"] = workflows.length_to_seconds(req["length"])
     req["relative_cost"] = round(workflows.relative_cost(width, height), 3)
     return req
 
 
 def build_workflow(req: dict) -> dict:
+    if req["mode"] == "t2i":
+        return workflows.build_t2i(
+            prompt_text=req["prompt"], width=req["width"], height=req["height"],
+            seed=req["seed"], steps=req["steps"], negative=req["negative"])
+
     common = dict(
         prompt_text=req["prompt"], width=req["width"], height=req["height"],
         length=req["length"], seed=req["seed"], steps=req["steps"],
         sampler=req["sampler"], scheduler=req["scheduler"],
         audio=req["audio"], audio_format=req["audio_format"],
         shift_video=req["shift_video"], shift_audio=req["shift_audio"],
+        prep_image=req["prep_image"],
     )
     if req["mode"] == "ref2v":
         return workflows.build_ref2va(
@@ -495,10 +560,12 @@ async def v1_options(request):
     unets, clips, vaes = (combo("UNETLoader", "unet_name"),
                           combo("CLIPLoader", "clip_name"),
                           combo("VAELoader", "vae_name"))
+    ckpts = combo("CheckpointLoaderSimple", "ckpt_name")
     d = workflows.DEFAULT_MODELS
     return web.json_response({
         "api_version": API_VERSION,
         "resolutions": workflows.resolution_options(),
+        "image_resolutions": workflows.image_resolution_options(),
         "samplers": combo("KSamplerSelect", "sampler_name"),
         "schedulers": combo("BasicScheduler", "scheduler"),
         "cost_model": {
@@ -515,6 +582,8 @@ async def v1_options(request):
             "text_encoder": d["clip"] in clips,
             "video_vae": d["video_vae"] in vaes,
             "audio_vae": d["audio_vae"] in vaes,
+            # 静止画生成。prep_image（参照画像の自動生成）にも必要。
+            "t2i": d["image_checkpoint"] in ckpts,
         },
         "limits": {**LIMITS, "fps": workflows.FPS,
                    "canvas_multiple": workflows.CANVAS_MULTIPLE},
@@ -639,10 +708,10 @@ async def _stream_artifact(request, slot: str, fallback_type: str):
     await refresh_from_history(comfy, job_id, job)
     ref = job.get(slot)
     if not ref:
-        if slot == "_comfy_audio" and job.get("status") == "done":
-            raise ApiError(404, "no_audio_file",
-                           "音声ファイルは出力されていません。"
-                           "生成時に audio_format を指定してください")
+        if slot in ("_comfy_audio", "_comfy_image") and job.get("status") == "done":
+            raise ApiError(404, "no_such_artifact",
+                           "そのファイルは出力されていません"
+                           "（音声は audio_format、静止画は t2i / prep_image が必要）")
         raise ApiError(409, "not_ready",
                        f"まだ成果物がありません (status={job.get('status')})")
 
@@ -665,6 +734,11 @@ async def _stream_artifact(request, slot: str, fallback_type: str):
 
 async def v1_video(request):
     return await _stream_artifact(request, "_comfy_file", "video/mp4")
+
+
+async def v1_image(request):
+    """静止画を取り出す（mode=t2i、または prep_image で作った参照画像）。"""
+    return await _stream_artifact(request, "_comfy_image", "image/png")
 
 
 async def v1_audio(request):
@@ -739,6 +813,7 @@ OPENAPI = {
         "/v1/jobs/{job_id}": {"get": {"summary": "ジョブの状態と進捗"}},
         "/v1/jobs/{job_id}/video": {"get": {"summary": "生成された mp4"}},
         "/v1/jobs/{job_id}/audio": {"get": {"summary": "音声のみ（audio_format 指定時）"}},
+        "/v1/jobs/{job_id}/image": {"get": {"summary": "静止画（mode=t2i / prep_image 使用時）"}},
         "/v1/jobs/{job_id}/cancel": {"post": {"summary": "実行中のジョブを中断"}},
         "/healthz": {"get": {"summary": "ヘルスチェック"}},
     },
@@ -774,6 +849,7 @@ def make_app(comfy_url: str, api_key: str = "") -> web.Application:
         web.get("/v1/jobs/{job_id}", v1_job),
         web.get("/v1/jobs/{job_id}/video", v1_video),
         web.get("/v1/jobs/{job_id}/audio", v1_audio),
+        web.get("/v1/jobs/{job_id}/image", v1_image),
         web.post("/v1/jobs/{job_id}/cancel", v1_cancel),
         web.static("/static", STATIC_DIR),
     ])
