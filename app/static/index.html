@@ -223,6 +223,16 @@
     </div>
     <div class="hint" id="shifthint">映像と音声それぞれの flow shift。
     空欄なら SigmaShift ノード自体を挟まず、モデル本来の挙動になります。</div>
+
+    <div id="sparsepane">
+    <label for="sparse">スパースアテンション</label>
+    <select id="sparse">
+      <option value="">使わない</option>
+      <option value="sol-attn">sol-attn（学習不要）</option>
+    </select>
+    <div class="hint">注意計算を間引いて速くします。864x480 以上で効果があり（GB10 で 14〜32% 短縮）、
+    低解像度では効果が薄く絵が崩れます。構図は密の場合と少し変わります。</div>
+    </div>
     </div>
   </details>
 
@@ -296,6 +306,8 @@ function applyMode() {
   $("#refpane").style.display = MODE === "ref2v" ? "block" : "none";
   const hasT2I = !CFG || !CFG.ready || CFG.ready.t2i;
   $("#preppane").style.display = (!isImage && hasT2I) ? "block" : "none";
+  const hasSparse = !!(CFG && CFG.ready && CFG.ready.sparse);
+  $("#sparsepane").style.display = (!isImage && hasSparse) ? "block" : "none";
   // 静止画には長さも音声も無い
   $("#seccol").style.display = isImage ? "none" : "block";
   $("#stepshint").style.display = isImage ? "none" : "block";
@@ -467,7 +479,8 @@ async function loadConfig() {
   }
 
   const R = CFG.ready;
-  const missing = Object.entries(R).filter(([, v]) => !v).map(([k]) => k);
+  // sparse はモデルではなく ComfyUI の版で決まる機能なので「未配置」には数えない
+  const missing = Object.entries(R).filter(([k, v]) => !v && k !== "sparse").map(([k]) => k);
   $("#health").innerHTML = missing.length
     ? `<b class="bad">未配置: ${missing.join(", ")}</b>`
     : `<b>モデル読込可</b>`;
@@ -478,6 +491,7 @@ async function loadConfig() {
     R.t2i ? "" : "none";
   $("#preppane").style.display =
     (R.t2i && MODE !== "t2i") ? "block" : "none";
+  $("#sparsepane").style.display = (R.sparse && MODE !== "t2i") ? "block" : "none";
 }
 
 $("#go").addEventListener("click", async () => {
@@ -500,6 +514,7 @@ $("#go").addEventListener("click", async () => {
     audio_format: $("#audiofmt").value || null,
     shift_video: $("#shiftv").value.trim() ? parseFloat($("#shiftv").value) : null,
     shift_audio: $("#shifta").value.trim() ? parseFloat($("#shifta").value) : null,
+    sparse: (MODE !== "t2i" && $("#sparse").value) || null,
   };
   if (MODE === "i2v" && !$("#prep").checked) {
     if (!flFiles.length) return alert("先頭フレームの画像を追加するか、参照静止画の自動生成を有効にしてください");

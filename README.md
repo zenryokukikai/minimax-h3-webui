@@ -298,6 +298,7 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 | `audio` | `true` | `false` で出力動画を無音にする（音声の生成自体は省けない、下記参照） |
 | `audio_format` | — | `flac` / `mp3` / `opus`。指定すると音声だけのファイルも出力し `audio_url` が返る |
 | `shift_video` `shift_audio` | — | 映像・音声それぞれの flow shift（0.01〜100、既定 12.0 / 3.0）。どちらか指定した場合のみ `MiniMaxH3SigmaShift` を挟む |
+| `sparse` | — | `true`（=`sol-attn`）/ `"sla"` / 設定オブジェクト。`BlockSparseAttention` を挟んで注意計算を間引く（下記参照）。ComfyUI 0.37 以降が必要（`/v1/options` の `ready.sparse`） |
 | `wait` `timeout` | `false` / 1800 | `true` で完了までブロック |
 
 エラーは HTTP ステータスと `{"error": {"code", "message"}}` で返ります。
@@ -306,6 +307,31 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 `GET /v1/options` の `limits` から取得できます。Web UI の入力欄の
 min/max もここから流し込まれるので、UI と API の食い違いは起きません。
 `steps` の上限を変えたいときはサーバ側だけ書き換えれば UI も追従します。
+
+### スパースアテンション（`sparse`）
+
+ComfyUI 0.37 で入った `BlockSparseAttention` を、サンプラーの前に挟みます。
+未指定ならノード自体を入れないので、従来と同じグラフです。
+
+```json
+{"sparse": {"method": "sol-attn", "tau": 1.3, "start_percent": 0.2, "end_percent": 1.0}}
+```
+
+- `sol-attn`: 学習不要。ヘッドとクエリブロックごとに閾値で残すブロックを決める。`tau` が大きいほど疎（既定 1.3）
+- `sla`: 上位 `keep_percent`% のブロックだけ残す。SLA 用 LoRA で蒸留した重み向けで、素の H3 だと低解像度で崩れる
+- 序盤 20%（`start_percent`）は密のまま。トークン数による自動の密フォールバックは使わない（`min_tokens=0`）
+
+**実測（GB10, 20 steps, NVFP4）**
+
+| 解像度 / フレーム | 密 | sol-attn |
+|---|---|---|
+| 384x384 / 192f | 83.8秒 | 76.0秒（-9%、絵が崩れる） |
+| 864x480 / 107f | 148秒 | 127秒（-14%） |
+| 864x480 / 192f | 346秒 | 243秒（-30%） |
+| 1920x1088 / 39f | 353秒 | 238秒（-32%） |
+
+トークン数が多いほど効きます。低解像度では注意計算の比率が小さく、効果が薄いうえに絵が崩れます。
+構図は密と少し変わります（同じシードでも同一にはならない）。
 
 ### 音声について
 

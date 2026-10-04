@@ -19,6 +19,13 @@ CANVAS_MULTIPLE = 32
 DEFAULT_SHIFT_VIDEO = 12.0
 DEFAULT_SHIFT_AUDIO = 3.0
 
+# BlockSparseAttention（ComfyUI 0.37 以降の comfy_extras/nodes_sparse_attention.py）。
+# 学習不要の sol-attn だけを既定の選択肢にする。sla は専用 LoRA で蒸留した重み向け
+# （素の H3 では 384x384 で崩れた）。GB10 実測: 864x480/107f で dense 148s → sol-attn 127s。
+SPARSE_METHODS = ("sol-attn", "sla")
+SPARSE_DEFAULTS = {"tau": 1.3, "keep_percent": 10.0, "start_percent": 0.2,
+                   "end_percent": 1.0, "min_tokens": 0}
+
 # 既定は Ampere (A100 等) 向けの INT8 ConvRot。
 # NVFP4 は Blackwell 専用命令、FP8 は Ada 以降なので、Ampere で
 # ネイティブに動く量子化形式は INT8 ConvRot だけになる。
@@ -322,7 +329,8 @@ def _sampler_tail(prompt: dict, cond_node: str, steps: int, seed: int,
                   sampler: str, scheduler: str, filename_prefix: str,
                   audio: bool = True, audio_format: str | None = None,
                   shift_video: float | None = None,
-                  shift_audio: float | None = None) -> dict:
+                  shift_audio: float | None = None,
+                  sparse: dict | None = None) -> dict:
     """conditioning + latent を受け取ってサンプリング〜動画保存までを繋ぐ。
 
     audio=False は「音声を生成しない」ではなく「出力動画に音声トラックを
@@ -341,6 +349,24 @@ def _sampler_tail(prompt: dict, cond_node: str, steps: int, seed: int,
             },
         }
         model_node = "sigma_shift"
+
+    # sparse 指定時だけ BlockSparseAttention を挟む（未指定はノード自体を入れない＝従来と同一グラフ）
+    if sparse:
+        sel = {"selection": sparse["method"]}
+        if sparse["method"] == "sol-attn":
+            sel["selection.tau"] = sparse["tau"]
+        else:
+            sel["selection.keep_percent"] = sparse["keep_percent"]
+        prompt["sparse"] = {
+            "class_type": "BlockSparseAttention",
+            "inputs": {"model": [model_node, 0], **sel,
+                       "start_percent": sparse["start_percent"],
+                       "end_percent": sparse["end_percent"],
+                       "min_tokens": sparse["min_tokens"], "dense_blocks": "",
+                       "extra_tokens": 256, "sink_conditioning": "exact_kv_and_rows",
+                       "verbose": False},
+        }
+        model_node = "sparse"
 
     prompt["noise"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}}
     prompt["guider"] = {
@@ -413,6 +439,7 @@ def build_fl2va(
     audio_format: str | None = None,
     shift_video: float | None = None,
     shift_audio: float | None = None,
+    sparse: dict | None = None,
     models: dict | None = None,
     filename_prefix: str = "minimax_h3/h3",
 ) -> dict:
@@ -449,7 +476,8 @@ def build_fl2va(
     prompt["cond"] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": cond_inputs}
     return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix,
                          audio=audio, audio_format=audio_format,
-                         shift_video=shift_video, shift_audio=shift_audio)
+                         shift_video=shift_video, shift_audio=shift_audio,
+                         sparse=sparse)
 
 
 def build_ref2va(
@@ -469,6 +497,7 @@ def build_ref2va(
     audio_format: str | None = None,
     shift_video: float | None = None,
     shift_audio: float | None = None,
+    sparse: dict | None = None,
     models: dict | None = None,
     filename_prefix: str = "minimax_h3/h3_ref",
 ) -> dict:
@@ -514,4 +543,5 @@ def build_ref2va(
     prompt["cond"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": cond_inputs}
     return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix,
                          audio=audio, audio_format=audio_format,
-                         shift_video=shift_video, shift_audio=shift_audio)
+                         shift_video=shift_video, shift_audio=shift_audio,
+                         sparse=sparse)

@@ -55,6 +55,15 @@ LIMITS = {
                     "default": workflows.IMAGE_DEFAULTS["steps"]},
     "image_size": {"default_width": 1344, "default_height": 768,
                    "reference_megapixels": 1.0},
+    # BlockSparseAttention。ComfyUI 側にノードがあるときだけ使える（/v1/options の ready.sparse）。
+    "sparse": {"methods": list(workflows.SPARSE_METHODS),
+               "tau": {"min": 0.0, "max": 4.0, "default": workflows.SPARSE_DEFAULTS["tau"]},
+               "keep_percent": {"min": 0.5, "max": 95.0,
+                                "default": workflows.SPARSE_DEFAULTS["keep_percent"]},
+               "start_percent": {"min": 0.0, "max": 1.0,
+                                 "default": workflows.SPARSE_DEFAULTS["start_percent"]},
+               "end_percent": {"min": 0.0, "max": 1.0,
+                               "default": workflows.SPARSE_DEFAULTS["end_percent"]}},
 }
 
 JOBS: "dict[str, dict]" = {}
@@ -229,6 +238,7 @@ def job_view(job_id: str, job: dict) -> dict:
             "shift_video": job.get("shift_video"),
             "shift_audio": job.get("shift_audio"),
             "prep_image": job.get("prep_image"),
+            "sparse": job.get("sparse"),
         },
         "relative_cost": job.get("relative_cost"),
         "created_at": job.get("created_at"),
@@ -348,6 +358,43 @@ def _seed(body: dict, key: str = "seed") -> int:
     if v in (None, "", -1):
         return random.randint(0, 2**63 - 1)
     return _int({key: v}, key, 0, 0, 2**63 - 1)
+
+
+def _sparse(spec) -> dict | None:
+    """sparse: true / "sol-attn" / {"method", "tau"|"keep_percent", "start_percent", "end_percent"}。"""
+    if spec in (None, False, ""):
+        return None
+    if spec is True:
+        spec = {}
+    elif isinstance(spec, str):
+        spec = {"method": spec}
+    if not isinstance(spec, dict):
+        raise ApiError(400, "invalid_parameter",
+                       "sparse は true / 手法名 / 設定オブジェクトで指定してください")
+    lim = LIMITS["sparse"]
+    method = spec.get("method") or "sol-attn"
+    if method not in lim["methods"]:
+        raise ApiError(400, "invalid_parameter",
+                       f"sparse.method は {lim['methods']} のいずれかです")
+    out = {"method": method, "min_tokens": workflows.SPARSE_DEFAULTS["min_tokens"]}
+    keys = ("start_percent", "end_percent",
+            "tau" if method == "sol-attn" else "keep_percent")
+    for key in keys:
+        v = spec.get(key, lim[key]["default"])
+        if isinstance(v, bool):
+            raise ApiError(400, "invalid_parameter", f"sparse.{key} は数値で指定してください")
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_parameter", f"sparse.{key} は数値で指定してください")
+        if not lim[key]["min"] <= v <= lim[key]["max"]:
+            raise ApiError(400, "invalid_parameter",
+                           f"sparse.{key} は {lim[key]['min']}〜{lim[key]['max']} の範囲です")
+        out[key] = v
+    if out["start_percent"] >= out["end_percent"]:
+        raise ApiError(400, "invalid_parameter",
+                       "sparse.start_percent は end_percent より小さくしてください")
+    return out
 
 
 def parse_request(body: dict) -> dict:
@@ -480,6 +527,8 @@ def parse_request(body: dict) -> dict:
     else:
         req["prep_image"] = None
 
+    req["sparse"] = _sparse(body.get("sparse"))
+
     req["seconds"] = workflows.length_to_seconds(req["length"])
     req["relative_cost"] = round(workflows.relative_cost(width, height), 3)
     return req
@@ -498,6 +547,7 @@ def build_workflow(req: dict) -> dict:
         audio=req["audio"], audio_format=req["audio_format"],
         shift_video=req["shift_video"], shift_audio=req["shift_audio"],
         prep_image=req["prep_image"],
+        sparse=req.get("sparse"),
     )
     if req["mode"] == "ref2v":
         return workflows.build_ref2va(
@@ -584,6 +634,8 @@ async def v1_options(request):
             "audio_vae": d["audio_vae"] in vaes,
             # 静止画生成。prep_image（参照画像の自動生成）にも必要。
             "t2i": d["image_checkpoint"] in ckpts,
+            # BlockSparseAttention（ComfyUI 0.37 以降）。無い環境で sparse を指定すると ComfyUI が拒否する。
+            "sparse": "BlockSparseAttention" in oi,
         },
         "limits": {**LIMITS, "fps": workflows.FPS,
                    "canvas_multiple": workflows.CANVAS_MULTIPLE},
