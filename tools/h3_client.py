@@ -149,6 +149,8 @@ def main(argv=None) -> int:
                    help="参照用の静止画を先に生成してから動画にする")
     g.add_argument("--prep-prompt", default=None,
                    help="静止画用のプロンプト（省略時は動画と同じ）")
+    g.add_argument("--sparse", default=None, choices=["sol-attn", "sla"],
+                   help="BlockSparseAttention で注意計算を間引く（大きい解像度ほど速くなる）")
     g.add_argument("--width", type=int, default=864)
     g.add_argument("--height", type=int, default=480)
     g.add_argument("--seconds", type=float, default=5)
@@ -218,6 +220,8 @@ def main(argv=None) -> int:
         if args.prep_image:
             params["prep_image"] = ({"prompt": args.prep_prompt}
                                     if args.prep_prompt else True)
+        if args.sparse:
+            params["sparse"] = args.sparse
         if args.seed is not None:
             params["seed"] = args.seed
         if args.sampler:
