@@ -372,15 +372,24 @@ def _sparse(spec) -> dict | None:
         raise ApiError(400, "invalid_parameter",
                        "sparse は true / 手法名 / 設定オブジェクトで指定してください")
     lim = LIMITS["sparse"]
-    method = spec.get("method") or "sol-attn"
+    method = spec.get("method")
+    if method is None:
+        method = "sol-attn"
     if method not in lim["methods"]:
         raise ApiError(400, "invalid_parameter",
                        f"sparse.method は {lim['methods']} のいずれかです")
     out = {"method": method, "min_tokens": workflows.SPARSE_DEFAULTS["min_tokens"]}
     keys = ("start_percent", "end_percent",
             "tau" if method == "sol-attn" else "keep_percent")
+    # 手法に合わないキーや綴り違いは黙って無視せず弾く（効いたと誤解させない）
+    unknown = sorted(set(spec) - {"method", *keys})
+    if unknown:
+        raise ApiError(400, "invalid_parameter",
+                       f"sparse に {method} では使えないキーがあります: {unknown}")
     for key in keys:
-        v = spec.get(key, lim[key]["default"])
+        v = spec.get(key)
+        if v is None:
+            v = lim[key]["default"]
         if isinstance(v, bool):
             raise ApiError(400, "invalid_parameter", f"sparse.{key} は数値で指定してください")
         try:
