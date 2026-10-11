@@ -64,6 +64,8 @@ LIMITS = {
                                  "default": workflows.SPARSE_DEFAULTS["start_percent"]},
                "end_percent": {"min": 0.0, "max": 1.0,
                                "default": workflows.SPARSE_DEFAULTS["end_percent"]}},
+    # LoRA（LoraLoaderModelOnly）。蒸留 LoRA で少ステップ化するときに使う。
+    "lora_strength": {"min": -10.0, "max": 10.0, "default": 1.0},
 }
 
 JOBS: "dict[str, dict]" = {}
@@ -239,6 +241,7 @@ def job_view(job_id: str, job: dict) -> dict:
             "shift_audio": job.get("shift_audio"),
             "prep_image": job.get("prep_image"),
             "sparse": job.get("sparse"),
+            "lora": job.get("lora"),
         },
         "relative_cost": job.get("relative_cost"),
         "created_at": job.get("created_at"),
@@ -406,6 +409,35 @@ def _sparse(spec) -> dict | None:
     return out
 
 
+def _lora(spec) -> dict | None:
+    """lora: "<ファイル名>" / {"name", "strength"}。ファイル名は ComfyUI の models/loras からの相対パス。"""
+    if spec in (None, False, ""):
+        return None
+    if isinstance(spec, str):
+        spec = {"name": spec}
+    if not isinstance(spec, dict):
+        raise ApiError(400, "invalid_parameter",
+                       "lora はファイル名か {name, strength} で指定してください")
+    unknown = sorted(set(spec) - {"name", "strength"})
+    if unknown:
+        raise ApiError(400, "invalid_parameter", f"lora に使えないキーがあります: {unknown}")
+    name = spec.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ApiError(400, "invalid_parameter", "lora.name は必須です")
+    lim = LIMITS["lora_strength"]
+    v = spec.get("strength", lim["default"])
+    if isinstance(v, bool):
+        raise ApiError(400, "invalid_parameter", "lora.strength は数値で指定してください")
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        raise ApiError(400, "invalid_parameter", "lora.strength は数値で指定してください")
+    if not lim["min"] <= v <= lim["max"]:
+        raise ApiError(400, "invalid_parameter",
+                       f"lora.strength は {lim['min']}〜{lim['max']} の範囲です")
+    return {"name": name.strip(), "strength": v}
+
+
 def parse_request(body: dict) -> dict:
     if not isinstance(body, dict):
         raise ApiError(400, "invalid_body", "JSON オブジェクトを送ってください")
@@ -537,6 +569,7 @@ def parse_request(body: dict) -> dict:
         req["prep_image"] = None
 
     req["sparse"] = _sparse(body.get("sparse"))
+    req["lora"] = _lora(body.get("lora"))
 
     req["seconds"] = workflows.length_to_seconds(req["length"])
     req["relative_cost"] = round(workflows.relative_cost(width, height), 3)
@@ -557,6 +590,7 @@ def build_workflow(req: dict) -> dict:
         shift_video=req["shift_video"], shift_audio=req["shift_audio"],
         prep_image=req["prep_image"],
         sparse=req.get("sparse"),
+        lora=req.get("lora"),
     )
     if req["mode"] == "ref2v":
         return workflows.build_ref2va(
@@ -626,6 +660,8 @@ async def v1_options(request):
         "resolutions": workflows.resolution_options(),
         "image_resolutions": workflows.image_resolution_options(),
         "samplers": combo("KSamplerSelect", "sampler_name"),
+        # models/loras に置かれた LoRA（lora パラメータに指定できる名前）
+        "loras": combo("LoraLoaderModelOnly", "lora_name"),
         "schedulers": combo("BasicScheduler", "scheduler"),
         "cost_model": {
             "c": workflows._COST_C,

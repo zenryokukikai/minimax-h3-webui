@@ -299,6 +299,7 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 | `audio_format` | — | `flac` / `mp3` / `opus`。指定すると音声だけのファイルも出力し `audio_url` が返る |
 | `shift_video` `shift_audio` | — | 映像・音声それぞれの flow shift（0.01〜100、既定 12.0 / 3.0）。どちらか指定した場合のみ `MiniMaxH3SigmaShift` を挟む |
 | `sparse` | — | `true`（=`sol-attn`）/ `"sla"` / 設定オブジェクト。`BlockSparseAttention` を挟んで注意計算を間引く（下記参照）。ComfyUI 0.37 以降が必要（`/v1/options` の `ready.sparse`） |
+| `lora` | — | ファイル名か `{"name", "strength"}`（strength 既定 1.0）。`LoraLoaderModelOnly` を挟む。指定できる名前は `/v1/options` の `loras` |
 | `wait` `timeout` | `false` / 1800 | `true` で完了までブロック |
 
 エラーは HTTP ステータスと `{"error": {"code", "message"}}` で返ります。
@@ -307,6 +308,26 @@ curl -sX POST http://your-host:18190/v1/jobs/$ID/cancel
 `GET /v1/options` の `limits` から取得できます。Web UI の入力欄の
 min/max もここから流し込まれるので、UI と API の食い違いは起きません。
 `steps` の上限を変えたいときはサーバ側だけ書き換えれば UI も追従します。
+
+### 少ステップ化 LoRA（`lora`）
+
+蒸留 LoRA（[lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo)、Apache-2.0）を
+`ComfyUI/models/loras/` に置き、`lora` とステップ数・サンプラー・shift を**モデル表どおりに揃えて**指定します。
+未指定ならノード自体を入れないので、従来と同じグラフです。
+
+```json
+{"lora": "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors",
+ "steps": 4, "sampler": "euler", "shift_video": 12, "shift_audio": 3}
+```
+
+**実測（GB10, NVFP4, 864x480 / 107f, prep_image 込み）**
+
+| 設定 | 時間 |
+|---|---|
+| 素の 20 steps + sol-attn | 141〜144秒 |
+| FL2VA Turbo 8-step v1.0 | 96秒 |
+| FL2VA Turbo 8-step v1.0 + sol-attn | 84秒（動きの多い場面で残像が出る） |
+| FL2VA Turbo 4-step v1.2 768p | 69秒 |
 
 ### スパースアテンション（`sparse`）
 
