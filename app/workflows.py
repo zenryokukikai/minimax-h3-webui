@@ -330,20 +330,31 @@ def _sampler_tail(prompt: dict, cond_node: str, steps: int, seed: int,
                   audio: bool = True, audio_format: str | None = None,
                   shift_video: float | None = None,
                   shift_audio: float | None = None,
-                  sparse: dict | None = None) -> dict:
+                  sparse: dict | None = None,
+                  lora: dict | None = None) -> dict:
     """conditioning + latent を受け取ってサンプリング〜動画保存までを繋ぐ。
 
     audio=False は「音声を生成しない」ではなく「出力動画に音声トラックを
     入れない」。H3 は映像と音声を単一の forward で同時に作るので、音声の
     計算自体は避けられず、省けるのは音声 VAE のデコードだけ。
     """
-    # shift が指定されたときだけ SigmaShift を挟む（既定は公式テンプレートと同じ挙動）
     model_node = "unet"
+    # lora 指定時だけ LoraLoaderModelOnly を最初に挟む（蒸留 LoRA で少ステップ化する用途）。
+    # 未指定ならノード自体を入れない＝従来と同一グラフ。
+    if lora:
+        prompt["lora"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": ["unet", 0], "lora_name": lora["name"],
+                       "strength_model": lora["strength"]},
+        }
+        model_node = "lora"
+
+    # shift が指定されたときだけ SigmaShift を挟む（既定は公式テンプレートと同じ挙動）
     if shift_video is not None or shift_audio is not None:
         prompt["sigma_shift"] = {
             "class_type": "MiniMaxH3SigmaShift",
             "inputs": {
-                "model": ["unet", 0],
+                "model": [model_node, 0],
                 "shift_video": DEFAULT_SHIFT_VIDEO if shift_video is None else shift_video,
                 "shift_audio": DEFAULT_SHIFT_AUDIO if shift_audio is None else shift_audio,
             },
@@ -440,6 +451,7 @@ def build_fl2va(
     shift_video: float | None = None,
     shift_audio: float | None = None,
     sparse: dict | None = None,
+    lora: dict | None = None,
     models: dict | None = None,
     filename_prefix: str = "minimax_h3/h3",
 ) -> dict:
@@ -477,7 +489,7 @@ def build_fl2va(
     return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix,
                          audio=audio, audio_format=audio_format,
                          shift_video=shift_video, shift_audio=shift_audio,
-                         sparse=sparse)
+                         sparse=sparse, lora=lora)
 
 
 def build_ref2va(
@@ -498,6 +510,7 @@ def build_ref2va(
     shift_video: float | None = None,
     shift_audio: float | None = None,
     sparse: dict | None = None,
+    lora: dict | None = None,
     models: dict | None = None,
     filename_prefix: str = "minimax_h3/h3_ref",
 ) -> dict:
@@ -544,4 +557,4 @@ def build_ref2va(
     return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix,
                          audio=audio, audio_format=audio_format,
                          shift_video=shift_video, shift_audio=shift_audio,
-                         sparse=sparse)
+                         sparse=sparse, lora=lora)
