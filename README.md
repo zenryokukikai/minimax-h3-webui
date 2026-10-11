@@ -314,6 +314,7 @@ min/max もここから流し込まれるので、UI と API の食い違いは�
 蒸留 LoRA（[lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo)、Apache-2.0）を
 `ComfyUI/models/loras/` に置き、`lora` とステップ数・サンプラー・shift を**モデル表どおりに揃えて**指定します。
 未指定ならノード自体を入れないので、従来と同じグラフです。
+LoRA とモードの組み合わせ（FL2V 用は t2v/i2v、Ref2V 用は ref2v）はサーバでは検証しないので、呼び出し側で揃えてください。
 
 ```json
 {"lora": "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors",
