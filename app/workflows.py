@@ -41,6 +41,9 @@ _BUILTIN_MODELS = {
     # 静止画生成 (HiDream-O1)。動画の参照画像を作るのにも使う。
     # A100 のような Ampere では FP8/MXFP8 がエミュレーションになるので BF16 を選ぶ。
     "image_checkpoint": "hidream_o1_image_dev_bf16.safetensors",
+    # 動画デコーダの差し替え（LightVAE。ComfyUI-LightVAE の LightVAELoader が必要）。
+    # 空なら video_vae をそのまま使う。GB10/高速LoRA の 107f で、全体 58s が INT8 版で 45s。
+    "video_decoder": "",
 }
 
 # HiDream-O1 Dev の既定サンプリング設定（公式テンプレート image_hidream_o1_dev.json）
@@ -325,6 +328,19 @@ AUDIO_SAVE_NODES = {
 }
 
 
+def _apply_video_decoder(prompt: dict, decoder: str) -> dict:
+    """video_decoder 指定時だけ、動画の VAEDecode を LightVAE のデコーダに差し替える。
+    エンコード（先頭/末尾フレームの取り込み）は元の video_vae のまま。"""
+    if not decoder:
+        return prompt
+    prompt["video_decoder"] = {
+        "class_type": "LightVAELoader",
+        "inputs": {"base_vae": ["video_vae", 0], "decoder": decoder, "encoder": "none"},
+    }
+    prompt["decode_video"]["inputs"]["vae"] = ["video_decoder", 0]
+    return prompt
+
+
 def _sampler_tail(prompt: dict, cond_node: str, steps: int, seed: int,
                   sampler: str, scheduler: str, filename_prefix: str,
                   audio: bool = True, audio_format: str | None = None,
@@ -486,10 +502,10 @@ def build_fl2va(
         cond_inputs["last_frame"] = ["last_frame", 0]
 
     prompt["cond"] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": cond_inputs}
-    return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix,
+    return _apply_video_decoder(_sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix,
                          audio=audio, audio_format=audio_format,
                          shift_video=shift_video, shift_audio=shift_audio,
-                         sparse=sparse, lora=lora)
+                         sparse=sparse, lora=lora), m["video_decoder"])
 
 
 def build_ref2va(
@@ -554,7 +570,7 @@ def build_ref2va(
         cond_inputs["ref_images"] = autogrow
 
     prompt["cond"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": cond_inputs}
-    return _sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix,
+    return _apply_video_decoder(_sampler_tail(prompt, "cond", steps, seed, sampler, scheduler, filename_prefix,
                          audio=audio, audio_format=audio_format,
                          shift_video=shift_video, shift_audio=shift_audio,
-                         sparse=sparse, lora=lora)
+                         sparse=sparse, lora=lora), m["video_decoder"])
