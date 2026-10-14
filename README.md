@@ -64,6 +64,18 @@ NVFP4 の DiT だけは別リポジトリ（例: [Abiray/Minimax-H3-nvfp4-INT4-I
 
 ファイル名は `app/models.json` で差し替えられます（`app/models.json.example` 参照）。
 
+### 軽量動画デコーダ（LightVAE、任意）
+
+`models.json` に `"video_decoder": "<ファイル名>"` を書くと、動画のデコードだけを [LightVAE](https://huggingface.co/lightx2v/LightVAE)（Apache-2.0）の軽量デコーダに差し替えます。先頭・末尾フレームを取り込むエンコードは元の Video VAE のままです。空または未指定なら差し替えません。
+
+必要なもの:
+
+- ComfyUI に [#16657](https://github.com/comfyanonymous/ComfyUI/pull/16657) が入っていること（v0.39.0 以降。v0.37.1 の場合は該当の 4 行を当てる）
+- カスタムノード [ComfyUI-LightVAE](https://github.com/ModelTC/LightVAE)（`LightVAELoader`）
+- 重みを `ComfyUI/models/vae/LightVAE/` に置く（例: `lightvae-lite-h3-decoder-int8-convrot.safetensors` 834MB）
+
+GB10・高速 LoRA（4 step）・参照静止画あり・864x480/107f での 1 本あたりの時間: 元のデコーダ 58.0秒 → Lite 48.0秒 → Lite INT8 45.1秒。細部がやや甘くなるが、構図・色・動きは変わらない。
+
 ## セットアップ
 
 ComfyUI 0.30.0 以降が必要です（MiniMax-H3 のネイティブ対応が入ったバージョン）。
